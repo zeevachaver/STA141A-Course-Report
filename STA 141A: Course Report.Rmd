@@ -1,0 +1,1731 @@
+---
+title: "STA 141A: Project Report"
+author: "Zeeva Chaver"
+date: "2024-03-18"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Abstract
+
+In this report, data was analyzed from a study conducted by Steinmetz et al. (2019), which measured the neural activity of mice upon performing a visual discrimination task. With aims to predict the outcome of this visual discrimination task based on neural data, given in the form of neuron spike trains, neuron firing rates were explored in this report in two different ways. To reduce the numerous neural spike trains into comparable forms across experiment trials, spike trains were either averaged for all neurons in a trial or each neuron had their spike trains averaged over all trials they were present in. To capture the neural activity across potential types of neurons, clustering on neurons was performed for both 3 and 4 clusters (for comparison purposes). To capture the differences in neural activity across various decision types (relating to the decision a mouse made in the visual discrimination task), models were trained and tested on data subsetted by each decision. Logistic Regression and XGBoost models were used to predict the outcome of the visual discrimination task, success or failure, and were applied to each decision type subset of the overall data, for each clustering type. This report shows the data exploration, integration, and predictive modeling processes performed with the overall goal of predicting either success or failure in the discrimination task. 
+
+# Section 1: Introduction
+
+In this study, experiment data was collected during 39 sessions, for 10 different mice. This report analyzes data from 18 sessions (Sessions 1 to 18), for 4 different mice: Cori, Forssmann, Hench, and Lederberg. Each session consists of several hundred trials, in which visual stimuli were randomly presented to the mouse on two screens positioned on both sides of it. The stimuli varied in terms of contrast levels, which took values of 0, 0.25, 0.5, or 1, with the value 0 for the absence of a stimulus. The mice were required to make decisions based on the stimuli, using a wheel controlled by their forepaws. Success per trial (called “feedback” in this report) was allocated in four different ways. The first way, called a trial of type Decision 1 in this report, has the left contrast greater than the right contrast, with success (1) given if the wheel is turned to the right and failure (-1) otherwise. The second way, called a trial of type Decision 2 in this report, has the left contrast smaller than the right contrast, where success (1) is allocated if the wheel is turned to the left and failure (-1) otherwise. The third way, called a trial of type Decision 3 in this report, has both contrasts being of value 0, where success (1) is allocated if the wheel is held still and failure (-1) otherwise. The fourth way, called a trial of type Decision 4 in this report, has both left and right contrasts being equal but non-zero, where the left or right stimuli will be randomly chosen (50%) as the correct choice.
+
+
+From 18 RDS files, we see information about each respective file’s session through eight variables. The structure of data for each trial revolves around eight features. The date the session took place and the mouse’s name are features that have one value per session. The left contrast, right contrast, and feedback type features are vectors with the number of elements being the total number of trials in a session. In Session 1, there are 114 trials, so these vectors contain 114 elements. However, the brain area feature is a vector with the number of elements as the total number of neurons with spikes tracked per session. In Session 1, there are 734 individual neurons (so this will be the element number of the brain area vector) with recorded activity throughout the 114 sessions. Each element of the brain area vector is the brain area that the specified neuron belongs to. The neuron spikes feature is in the form of a list of matrices, each element being a matrix for each trial with dimensions of the total number of neurons in a session and 40 time bins, representing 0.01 seconds over the 0.4 seconds that each trial is held over. For Session 1, the neuron spikes feature will be a list of 114 elements, each element being a matrix with the dimensions of 734 neurons by 40 time bins. The time feature is a list of 114 vectors, with each element being a 40-element vector. The elements in each 40 vector represent the 40 time bins, a specific 0.01 second time interval.
+
+
+
+# Section 2: Exploratory Analysis
+
+```{r, echo=FALSE, message=FALSE}
+library(tibble)
+library(caret)
+library(clustMixType)
+library(dplyr) # for data cleaning
+library(gridExtra)    # Plot ggplot side-by-side
+library(Rtsne) # for t-SNE plot
+library(ggplot2) # for visualization
+library(nomclust) # for sm distance 
+library(cluster) # for gower similarity
+library(caret) # confusion matrix
+library(mltools)
+library(data.table)
+library(gridExtra)    # Plot ggplot side-by-side
+library(kableExtra)
+library(xgboost)
+library(prediction)
+library(pROC)
+```
+
+```{r, echo=FALSE}
+setwd("/Users/zeevachaver/Documents/sta 141a/project")
+
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+}
+```
+
+This table showcases some of the features available for each session, including the number of unique neurons, the number of trials, the number of trials for each decision type, and the success rate over all trials in that session.
+
+```{r, echo=FALSE}
+n.session=18
+
+meta = tibble(
+  "Session" = rep(0,n.session),
+  "Number of Neurons" = rep(0,n.session),
+  "Number of Trials" = rep(0,n.session),
+  "Number of Decision 1 Trials" = rep(0,n.session),
+  "Number of Decision 2 Trials" = rep(0,n.session),
+  "Number of Decision 3 Trials" = rep(0,n.session),
+  "Number of Decision 4 Trials" = rep(0,n.session),
+  "Success Rate" = rep(0,n.session)
+)
+decision1_sum = 0
+decision2_sum = 0
+decision3_sum = 0
+decision4_sum = 0
+
+for(i in 1:n.session){
+  
+  for (j in 1:length(session[[i]]$spks))
+  # decision:
+  if (session[[i]]$contrast_left[j] > session[[i]]$contrast_right[j]){
+    decision1_sum = decision1_sum + 1# right contrast < left contrast --> decision 1
+  }else if (session[[i]]$contrast_left[j] < session[[i]]$contrast_right[j]){
+    decision2_sum = decision2_sum + 1 # right contrast > left contrast --> decision 2
+  }else if (session[[i]]$contrast_left[j] == session[[i]]$contrast_right[j] 
+                     & session[[i]]$contrast_left[j] == 0){
+    decision3_sum = decision3_sum + 1 # left contrast = right contrast = 0 --> decision 3
+  }else{  # left contrast = right contrast != 0 --> decision 4
+    decision4_sum = decision4_sum + 1
+  }
+  
+  tmp = session[[i]];
+  meta[i,1]=i;
+  meta[i,2]=dim(tmp$spks[[1]])[1];
+  meta[i,3]=length(tmp$feedback_type);
+  meta[i,4]=decision1_sum;
+  meta[i,5]=decision2_sum;
+  meta[i,6]=decision3_sum;
+  meta[i,7]=decision4_sum;
+  meta[i,8]=mean(tmp$feedback_type+1)/2;
+}
+  
+kable(meta, format = "html", table.attr = "class='table table-striped'",digits=4) 
+```
+
+The dimensions of the data in this study vary across sessions, with each session containing differing numbers of unique neurons, trials, and trials falling under each decision type. With the interest of summarizing neuron activity across trials and eventually sessions, neuron spike trains and their patterns in trials with different decision types can be explored.
+
+To see what an average neuron firing rate plot looks like, the average spikes across all neurons in one trial, in one session, can be plotted as an example. Below is a plot visualizing the neuron spikes in Trial 1, Session 1, averaged over the 40 time bins. 
+
+```{r, echo=FALSE}
+spks.trial=session[[1]]$spks[[1]]
+total.spikes=apply(spks.trial,1,sum) # total spikes per neuron for trial 1, session 1 
+avg.spikes=mean(total.spikes) # average number of spikes per neuron in the first 0.4 seconds of Trial 1 in Session 1
+firing.rate=apply(spks.trial,2,mean) # gives 40 elem vector, this is firing rate for each time bin 
+plot(firing.rate, type = "l", main = "Trial 1, Session 1", xlab = "Time Bins", ylab = "Neuron Firing Rate")
+```
+
+In this plot, the x-axis represents time bins, each bin contributing to the 0.4 second time period in which experiment data is collected per trial. The y-axis represents the neuron firing rate, which is the neuron firing activity averaged over all neurons in a trial (in this plot, trial 1 in session 1). To explore neuron firing rate at a higher level, neuron firing activity can be averaged over all neurons in a session, since neurons are the same across all trials in a given session.
+
+
+```{r, echo=FALSE}
+# function - create dataframe with firing.rates per time bins across trials for each session 
+firing.rates.session = function(session.num, total.trial.num) {
+  for (i in 1:total.trial.num) {
+    spks.trial=session[[session.num]]$spks[[i]] 
+    firing.rate.trial = apply(spks.trial,2,mean) # gives 40 elem vector- avg number of neurons spiked per time bin
+    firing.rate.trial = matrix(firing.rate.trial,nrow=1)
+    firing.rate.trial = cbind(firing.rate.trial, c(session[[session.num]]$feedback_type[i]), c(i), c(session.num)) # add cols at end of vector for feedback value and trial number
+    
+    # add column for decision
+    # left contrast > right contrast --> decision 1
+    if (session[[session.num]]$contrast_left[i] > session[[session.num]]$contrast_right[i]){
+        firing.rate.trial = cbind(firing.rate.trial, c(1))}
+    # right contrast > left contrast --> decision 2
+    else if (session[[session.num]]$contrast_left[i] < session[[session.num]]$contrast_right[i]){
+        firing.rate.trial = cbind(firing.rate.trial, c(2))
+    # left contrast = right contrast = 0 --> decision 3
+    } else if (session[[session.num]]$contrast_left[i] == session[[session.num]]$contrast_right[i] 
+               & session[[session.num]]$contrast_left[i] == 0){
+        firing.rate.trial = cbind(firing.rate.trial, c(3))}
+    # left contrast = right contrast != 0 --> decision 4
+    else{
+        firing.rate.trial = cbind(firing.rate.trial, c(4)) 
+    }
+    
+    if (i == 1) {
+      firing.spks.session = as.data.frame(firing.rate.trial) 
+    }
+    else {
+      firing.spks.session = bind_rows(firing.spks.session, as.data.frame(firing.rate.trial))
+    }
+  }
+  
+  names <- c(bin_1 = "V1", bin_2 ="V2", bin_3 = "V3", bin_4 = "V4", bin_5 ="V5", bin_6 = "V6", bin_7 = "V7", bin_8 ="V8", bin_9 = "V9", bin_10 = "V10", bin_11 ="V11", bin_12 = "V12", bin_13 = "V13", bin_14 ="V14", bin_15 = "V15", bin_16 = "V16", bin_17 ="V17", bin_18 = "V18", bin_19 = "V19", bin_20 ="V20", bin_21 = "V21", bin_22 = "V22", bin_23 ="V23", bin_24 = "V24", bin_25 = "V25", bin_26 ="V26", bin_27 = "V27", bin_28 = "V28", bin_29 ="V29", bin_30 = "V30", bin_31 = "V31", bin_32 = "V32", bin_33 ="V33", bin_34 = "V34", bin_35 = "V35", bin_36 ="V36", bin_37 = "V37", bin_38 = "V38", bin_39 ="V39", bin_40 = "V40", feedback = "V41", trial = "V42", session = "V43", decision = "V44")
+  firing.spks.session = firing.spks.session %>% rename(!!!names)
+  firing.spks.session$feedback = as.factor(firing.spks.session$feedback)
+  firing.spks.session$decision = as.factor(firing.spks.session$decision)
+  
+  return(firing.spks.session)
+}
+```
+
+
+```{r, echo=FALSE}
+# create empty list to store the data frames
+firing.rate.sessions.list = list()
+
+for (i in 1:18) {
+  data = firing.rates.session(session.num = i, total.trial.num = length(session[[i]]$spks))
+  
+  # assign a name to data frame
+  df_name = paste0("firing.rate.session", i)
+  
+  # store the data frame in a list (of all session dfs)
+  firing.rate.sessions.list[[df_name]] = data
+}
+```
+
+Neuron firing rates can be plotted for each session, separated and averaged over the two feedback outcomes of success (1) and failure (-1).
+
+```{r, echo=FALSE}
+difference.vectors.list = list()
+success.rate.list = list()
+
+par(mfrow=c(2,3))
+i = 0
+
+for (session.df in firing.rate.sessions.list){
+  failure.vec.ses = as.vector(colMeans(subset(subset(session.df, feedback == '-1'), select = -c(feedback, trial, session, decision))))
+  success.vec.ses = as.vector(colMeans(subset(subset(session.df, feedback == '1'), select = -c(feedback, trial, session, decision))))
+
+  i = i + 1
+  plot(x=0,y=0, col='white',xlim=c(0,40),ylim=c(0.015,0.08), xlab="Time Bins",ylab="Neuron Firing Rate", main=paste("Session ", i))
+  lines(failure.vec.ses, type='l', col = 'red')
+  lines(success.vec.ses, type='l', col = 'green')
+  difference.vectors.list[[i]] = success.vec.ses-failure.vec.ses
+  tmp = session[[i]]
+  success.rate.list[[i]]=mean(tmp$feedback_type+1)/2;
+  
+  legend("topleft", legend = c("Success", "Failure"), 
+         col = c("green","red"), 
+         lty = 1)
+}
+```
+
+From these plots, it is seen that the neuron firing rate averaged over trials resulting in success is higher than of those resulting in failure. Some of the plots with greater average neuron firing rates can be seen for Session 3, 13, and 15. However, the success rates for each of these sessions fall under different ranges, being between 0.6-0.7 for Session 3, between 0.7-0.8 for Session 15, and almost 0.8 for Session 13. To look more into success rate and neuron firing rate levels, vectors that are the difference of the average neuron firing rates for success and for failure can be graphed, with colors relating to different success rate ranges.
+
+```{r, echo=FALSE}
+plot(x=0,y=0, col='white',xlim=c(0,40),ylim=c(-0.005,0.015), xlab="Time Bins",ylab="Neuron Firing Rate", main=paste("Session Neuron Firing Rate for Success-Failure Differences"))
+j = 0
+for (i in difference.vectors.list) {
+  j=j+1
+  success.rate = success.rate.list[[j]]
+  if (success.rate >= 0.8) {
+    line.col = 'red'
+  }
+  else if (success.rate > 0.7) {
+    line.col = 'orange'
+  }
+  else {
+    line.col = 'yellow'
+  }
+  lines(i, type = 'l', col = line.col, lty=2, lwd=1)
+  lines(smooth.spline(i), col=line.col, lwd=2)
+}
+legend("topleft", legend = c("Success Rate < 0.7", "Success Rate < 0.8", "Success Rate >= 0.8"), 
+         col = c("yellow","orange", "red"), 
+         lty = 1)
+```
+
+From this plot, it seems that sessions with greater success rates had generally lower differences in neural spike activity between success and failure. Sessions with the greatest success rate appear in red and show near 0, and generally more constant, differences between success and failure firing rates. Sessions with the smallest success rate appear in yellow, some of which show much greater differences between success and failure firing rates than those of other success ranges, as well as non-constant differences with upward sloping tending to start after the 10th time bin. Sessions with success rates in between the other two ranges generally show lower and more constant differences, similar to those of sessions with success rates at or above 0.8, except for one session which shows similar difference activity to sessions with lower success rates.
+
+To explore the differences between neuron firing rates of different decisions, neuron firing rates across all sessions can be averaged over decision and feedback type combinations. To do this, average neuron firing rates calculated for each trial can be added to an overall dataframe, which then has averages taken over each decision type and feedback combination. This results in eight 40-element vectors, one for each decision type and feedback outcome combination (e.g. one combination being Decision 1 - Failure), which when plotted can aid in visualizing neuron firing rate patterns across decisions.
+
+```{r, echo=FALSE}
+firing.rate.df = bind_rows(firing.rate.sessions.list)
+```
+
+```{r, echo=FALSE}
+dec1.failure.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '1' & feedback == '-1'), select = -c(feedback, trial, session, decision))))
+dec1.success.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '1' & feedback == '1'), select = -c(feedback, trial, session, decision))))
+
+dec2.failure.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '2' & feedback == '-1'), select = -c(feedback, trial, session, decision))))
+dec2.success.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '2' & feedback == '1'), select = -c(feedback, trial, session, decision))))
+
+dec3.failure.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '3' & feedback == '-1'), select = -c(feedback, trial, session, decision))))
+dec3.success.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '3' & feedback == '1'), select = -c(feedback, trial, session, decision))))
+
+dec4.failure.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '4' & feedback == '-1'), select = -c(feedback, trial, session, decision))))
+dec4.success.vec = as.vector(colMeans(subset(subset(firing.rate.df, decision == '4' & feedback == '1'), select = -c(feedback, trial, session, decision))))
+```
+
+```{r, echo=FALSE}
+plot(x=0,y=0, col='white',xlim=c(0,40),ylim=c(0.025,0.05), xlab="Time Bins", ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate for Decision Type (Success and Failure)"))
+
+lines(dec1.failure.vec, type='l', col = 'blue', lty = 2)
+lines(dec1.success.vec, type='l', col = 'blue')
+lines(dec2.failure.vec, type='l', col = 'red', lty = 2)
+lines(dec2.success.vec, type='l', col = 'red')
+lines(dec3.failure.vec, type='l', col = 'green', lty = 2)
+lines(dec3.success.vec, type='l', col = 'green')
+lines(dec4.failure.vec, type='l', col = 'purple', lty = 2)
+lines(dec4.success.vec, type='l', col = 'purple')
+
+
+legend("topright", legend = c("Decision 1", "Decision 2", "Decision 3", "Decision 4"), 
+       col = c("blue", "red", "green", "purple"), 
+       lty = 1)
+```
+
+This plot shows the neuron firing rate across all trials and sessions for the four decisions, separated by the feedback outcome of success (solid line) and failure (dashed line) for each decision. Decision 1 represents the case where the left contrast (the contrast of the left stimuli) is greater than the right contrast (the contrast of the right stimuli). Decision 2 is the case where the right contrast is greater than the left contrast. In these two cases, success occurs when the mouse in a trial turns towards the greater contrast. Decision 3 is the case where the left contrast and right contrast is 0. Success occurs when the mouse does not turn towards either contrast. Decision 4 is the case where the left and right contrasts are equal but non-zero. Success occurs when the mouse turns towards the randomly chosen correct stimulus. 
+
+From this plot, it can be observed that for Decisions 1, 2, and 4, the neuron firing rate for success is greater than that of failure. However for Decision 3, the neuron firing rate for failure is greater than that of success. Since success for trials of Decision type 3 is determined by no movement by the mouse, higher neural activity for failure may be seen due to mice trying to choose one stimuli over another, as needed in every other decision type in this visual discrimination task, rather than correctly assess that both the stimuli are zero.
+
+To further understand the difference between the success and failure neuron firing rates for each decision, the difference of the success and failure vectors for each decision can be graphed.
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,40),ylim=c(-0.01,0.02), xlab="Time Bins",ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate per Time Bin"))
+
+lines(dec1.success.vec-dec1.failure.vec, type='l', col = 'blue')
+lines(dec2.success.vec-dec2.failure.vec, type='l', col = 'red')
+lines(dec3.success.vec-dec3.failure.vec, type='l', col = 'green')
+lines(dec4.success.vec-dec4.failure.vec, type='l', col = 'purple')
+
+legend("topright", legend = c("Decision 1", "Decision 2", "Decision 3", "Decision 4"), 
+       col = c("blue", "red", "green", "purple"), 
+       lty = 1)
+```
+
+From this plot, the difference between the neuron firing rates resulting in success and failure are near constant for Decision 3 and Decision 4. Decision 3 and 4 are cases where both stimuli have equal contrast levels, but the decisions are differentiated by either both stimuli being zero or non-zero. In Decision 3, both stimuli have contrast 0 and the lowest difference in neuron firing rates, a slightly negative difference, can be seen but as a relatively flat line. In Decision 4, both stimuli have equal contrast levels but are non-zero, and we see a similarly flat line for the difference in neuron firing rates, but with a higher level of neural activity. 
+
+The difference between the firing rates resulting in success and failure is not constant for Decisions 1 and 2, however the difference lines are very similar for these two decisions, following a similar curve pattern of increase followed by a leveling out. Feedback for these two decisions types is awarded in a similar way, based on turning the wheel towards the greater contrast level.
+
+We see similarities between the difference curve patterns and firing rates, nearly lining up entirely, for Decisions 1 and 2, two decision types which have a similar method of determining success and failure. We see similarities between the line patterns for Decisions 3 and 4, both being relatively flat, but different firing rates, with Decision 4 having higher levels than Decision 3.
+
+For the purpose of predicting feedback, experiment data can be subsetted according to decisions, allowing for three separate models to be created. One model will contain data from Decisions 1 and 2, due to the differences in average neuron firing rate for success and failure being very similar, but from time bins 20 to 40 (to capture only the constant differences between success and failure for each decision). The other two models will contain data from Decision 3 and Decision 4, one model for each decision type in order to capture the differences in firing rate levels between the two decisions. However, as these two decisions show constant differences between success and failure neuron firing rates across all 40 time bins, these two models will be trained and tested on data from all time bins.
+
+However, due to the current dataframe that has been created, where each row represents one trial in one session with all neuron activity for each trial averaged over the 40 time bins, there is the possibility that specific neuron data cannot be captured in the modeling process. As each session contains multiple (the number of trials worth of) spike trains for each neuron, the firing rates of each neuron in a session over 40 time bins can be averaged over all trials in that session.
+
+After seeing that decisions types affect neuron spike activity and patterns, the spike activity for each neuron in this study (each individual neuron in each session) can be averaged over trials. These individual neuron firing rates can be averaged specifically over trials with each decision and feedback type combination, with the goal of being incorporated into predictive feedback modeling according to decision types. With over 16,000 individual neurons having recorded activity in this study, the firing rate for each neuron, averaged over trials with particular decision types can be explored. Individual neurons will be clustered according to their firing rates across each decision type and feedback combination using K-Means clustering, carried out for both 3 and 4 clusters.
+
+```{r, echo=FALSE}
+# get neuron 320 vector - average 
+get.neuron.vector = function(session.num, trial.num, neuron.num) {
+  # initialize empty dataframe
+  neuron.data = data.frame(bin1=integer(), bin2=integer(), bin3=integer(), bin4=integer(), bin5=integer(), bin6=integer(), bin7=integer(), bin8=integer(), bin9=integer(), bin10=integer(), bin11=integer(), bin12=integer(), bin13=integer(), bin14=integer(), bin15=integer(), bin16=integer(), bin17=integer(), bin18=integer(), bin19=integer(), bin20=integer(), bin21=integer(), bin22=integer(), bin23=integer(), bin24=integer(), bin25=integer(), bin26=integer(), bin27=integer(), bin28=integer(), bin29=integer(), bin30=integer(), bin31=integer(), bin32=integer(), bin33=integer(), bin34=integer(), bin35=integer(), bin36=integer(), bin37=integer(), bin38=integer(), bin39=integer(), bin40=integer(), feedback=integer(), decision=integer()) #int or float type ?
+  
+  # create matrix with vectors of specific neuron spikes (per 40 time bins) from each trial (same neuron across all trials in a matrix)
+  for (i in 1:trial.num) {
+    # get vector of neuron spikes across 40 time bins for a specific neuron, in a specific 
+    neuron.trial.vec = session[[session.num]]$spks[[i]][neuron.num,] 
+    neuron.trial.vec = append(neuron.trial.vec, c(session[[session.num]]$feedback_type[i]))  # append feedback value at end of vector
+    
+    # append decision type at end of vector
+    # left contrast > right contrast --> decision 1
+    if (session[[session.num]]$contrast_left[i] > session[[session.num]]$contrast_right[i]){
+      neuron.trial.vec = append(neuron.trial.vec,c(1))
+    }
+    # right contrast > left contrast --> decision 2
+    else if (session[[session.num]]$contrast_left[i] < session[[session.num]]$contrast_right[i]){
+      neuron.trial.vec = append(neuron.trial.vec,c(2))
+    }
+    # left contrast = right contrast = 0 --> decision 3
+    else if (session[[session.num]]$contrast_left[i] == session[[session.num]]$contrast_right[i] 
+               & session[[session.num]]$contrast_left[i] == 0){
+      neuron.trial.vec = append(neuron.trial.vec,c(3))
+    }
+    # left contrast = right contrast != 0 --> decision 4
+    else{
+      neuron.trial.vec = append(neuron.trial.vec,c(4))
+    }
+    
+    neuron.trial.vec = as.vector(neuron.trial.vec)
+    neuron.data[i,] = neuron.trial.vec # add trial neuron vector to matrix for specific neuron
+  }
+  
+  neuron.data$feedback = as.factor(neuron.data$feedback)
+  neuron.data$decision = as.factor(neuron.data$decision)
+  
+  # subset dataframe by decisions and feedback - get 8 subsets
+  neuron.session.dec1.success = subset(neuron.data, decision == 1 & feedback == 1)
+  neuron.session.dec1.failure = subset(neuron.data, decision == 1 & feedback == -1)
+  
+  neuron.session.dec2.success = subset(neuron.data, decision == 2 & feedback == 1)
+  neuron.session.dec2.failure = subset(neuron.data, decision == 2 & feedback == -1)
+  
+  neuron.session.dec3.success = subset(neuron.data, decision == 3 & feedback == 1)
+  neuron.session.dec3.failure = subset(neuron.data, decision == 3 & feedback == -1)
+  
+  neuron.session.dec4.success = subset(neuron.data, decision == 4 & feedback == 1)
+  neuron.session.dec4.failure = subset(neuron.data, decision == 4 & feedback == -1)
+  
+  # take averages of each column (time bin), to get average neuron spikes per time bin for each of the 8 subsets
+  avg.neuron.session.dec1.success = colMeans(subset(neuron.session.dec1.success, select = -c(feedback, decision)))
+  avg.neuron.session.dec1.failure = colMeans(subset(neuron.session.dec1.failure, select = -c(feedback, decision)))
+  
+  avg.neuron.session.dec2.success = colMeans(subset(neuron.session.dec2.success, select = -c(feedback, decision)))
+  avg.neuron.session.dec2.failure = colMeans(subset(neuron.session.dec2.failure, select = -c(feedback, decision)))
+  
+  avg.neuron.session.dec3.success = colMeans(subset(neuron.session.dec3.success, select = -c(feedback, decision)))
+  avg.neuron.session.dec3.failure = colMeans(subset(neuron.session.dec3.failure, select = -c(feedback, decision)))
+  
+  avg.neuron.session.dec4.success = colMeans(subset(neuron.session.dec4.success, select = -c(feedback, decision)))
+  avg.neuron.session.dec4.failure = colMeans(subset(neuron.session.dec4.failure, select = -c(feedback, decision)))
+  
+  # concatenate vectors together into one long neuron vector - with average spikes per time bin, per each decision and feedback combination
+  # order (each combination representing 40 time bins in neuron overall): dec1 success, dec1 failure, dec2 success, dec2 failure, dec3 success, dec3 failure, dec4 success, dec4 failure
+  neuron.session.vector = c(as.vector(avg.neuron.session.dec1.success), as.vector(avg.neuron.session.dec1.failure), 
+                            as.vector(avg.neuron.session.dec2.success), as.vector(avg.neuron.session.dec2.failure), 
+                            as.vector(avg.neuron.session.dec3.success), as.vector(avg.neuron.session.dec3.failure),
+                            as.vector(avg.neuron.session.dec4.success), as.vector(avg.neuron.session.dec4.failure))
+
+  return(neuron.session.vector)
+}
+```
+
+
+```{r, echo=FALSE}
+# get session dataframe (e.g. for session 1, 320 time bins x 734 neurons)
+get.session.df = function(session.num) {
+  # initialize empty dataframe
+  neuron.session.data = data.frame(matrix(ncol = 321, nrow = 0))
+  for (i in 1:length(session[[session.num]]$brain_area)) { # 1:num of unique neurons in specific session (session.num)
+    neuron.i.vec = get.neuron.vector(session.num, length(session[[session.num]]$spks), i)
+    neuron.i.vec= append(neuron.i.vec, c(session.num)) # add column for session number
+    neuron.session.data[i,] = neuron.i.vec
+  }
+  colnames(neuron.session.data)[321] = "session"
+  return(neuron.session.data)
+}
+```
+
+
+```{r, echo=FALSE}
+# create overall dataframe with combining all session dfs 
+get.neuron.df = function(n.sessions) {
+  for (i in 1:n.sessions) {
+    if (i == 1) {
+      neurons.session = get.session.df(i) # session df
+      df = neurons.session
+    }
+    else {
+      neurons.session = get.session.df(i) # session df
+      df = bind_rows(df, neurons.session)
+    }
+  }
+  return(df)
+}
+```
+
+```{r, echo=FALSE}
+neuron.df = get.neuron.df(18)
+```
+
+In order to perform clustering over all neurons, a dataframe with neuron firing rate information is first created. In this dataset, each row represents one specific neuron that had activity recorded in one of the study's 18 sessions. Summing all of the unique neurons from all sessions, this dataset has 16,305 rows, one row for each neuron. This dataset has 321 columns. The first 320 columns include the average firing rate for the neuron across 40 time bins, for each decision and feedback outcome combination. The first 40 time bins in each row have the average firing rate for that neuron over the trials that fell under Decision 1 and had an outcome of success. The next 280 time bins have the average firing rate for that neuron over 40 time bins for each decision and feedback outcome combination, in the order of Decision 1 and failure, Decision 2 and success, Decision 2 and failure, Decision 3 and success, Decision 3 and failure, Decision 4 and success, and Decision 4 and failure. The last column includes the session number that each neuron comes from, to keep track of each neuron's origin in this overall dataframe.
+
+### K-Means: 3 Clusters
+
+K-means clustering will be performed on a subset of this dataset, not including the session ID column, as the average firing rates for all decision and feedback outcome combinations are numerical data. This subset will be one-hot encoded and scaled before performing K-means clustering, initially for three clusters.
+
+```{r, echo=FALSE}
+# K-means: 3 Clusters
+neuron.df$session = as.factor(neuron.df$session)
+
+df.oh = one_hot(as.data.table(subset(neuron.df, select = -c(session))))
+```
+
+```{r, echo=FALSE}
+df.oh = df.oh %>% as.data.frame()
+df.oh.scaled = df.oh %>% scale()
+```
+
+```{r, echo=FALSE}
+set.seed(1)
+fitk3 = kmeans(x = df.oh.scaled, center = 3, nstart = 100)
+```
+
+After performing K-means clustering with a center of 3, 3 clusters were determined with sizes 1782, 189, 14334. 
+
+```{r, echo=FALSE}
+fitk3$size
+```
+
+By looking at the cluster means for the first 6 time bins (out of 320 time bins), it appears that the third cluster of neurons shows the lowest average firing rates across time bins, as compared to the average firing rates for the two other clusters. The second cluster of neurons shows the highest average firing rates across time bins, being much higher than either of the other two cluster means. The first cluster of neurons shows average firing rates across time bins being in the middle of the other two clusters, but still much lower than those the second cluster. The actual values of the cluster means should not be interpreted directly, as the cluster means are computed from the scaled data.  
+
+```{r, echo=FALSE}
+fitk3$centers[,1:6]
+```
+
+The cluster vector (containing the cluster number for each neuron in this dataframe) can be extracted and binded to the neuron dataframe. This will allow for further analysis of neuron firing rates in clusters, within sessions themselves and eventually individual trials (with the neuron firing rates still split between decision and feedback type combinations). 
+
+```{r, echo=FALSE}
+df.k3 = cbind(neuron.df, fitk3$cluster)
+colnames(df.k3)[322] = "cluster"
+df.k3$cluster = as.factor(df.k3$cluster)
+```
+
+It's important to note for later data integration that cluster 2 has a small size, meaning some sessions may not have neurons in that cluster, for example, in session 16. As more numbers of clusters are explored, cluster sizes may also continue to shrink.
+
+```{r, echo=FALSE}
+nrow(df.k3 %>% filter(session == 16, cluster == 2))
+```
+
+To visualize the similarities in firing rates among neurons in the same clusters, 3000 random neurons can be picked to be graphed over the 320 time bins.
+
+```{r, echo=FALSE}
+set.seed(123)
+df.k3.subsample = df.k3[sample(nrow(df.k3),3000),]
+```
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,320),ylim=c(0,2), xlab="Time Bins", ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate with 3 Clusters"))
+
+for(i in 1:300){
+  if(df.k3.subsample[i,]$cluster == 1) {
+    line.col = 'green'
+  }
+  else if (df.k3.subsample[i,]$cluster == 2){
+    line.col = 'blue'
+  }
+  else {
+    line.col = 'red'
+  }
+  lines(as.numeric(df.k3.subsample[i,][-c(321,322)]), type = 'l', col=line.col)
+}
+
+abline(v=c(41,81,121,161,201,241,281), col=c("black", "black","black","black","black","black","black"), lty=c(2,2,2,2,2,2,2), lwd=c(1,1,1,1,1,1,1))
+
+legend("topleft", legend = c("Cluster 1", "Cluster 2", "Cluster 3"), 
+       col = c("green","blue", "red"), 
+       lty = 1)
+```
+
+In this plot, neurons in the same cluster have similar neural activity and trends across decision and feedback combinations. Neurons in Cluster 3 have the lowest activity, with their average neural spikes (in red) found to be very low on the graph. Cluster 1 neurons, seen in green, have higher activity than those in Cluster 3 with their average neural spikes being in the middle of the graph (and in the middle of the activity of the other two clusters). Cluster 2 has neurons with the highest neural activity, with average firing rates for those neurons being much higher than those of the other clusters. Before beginning data integration with this cluster information to build models for prediction, K-Means clustering can be performed and visualized once again for 4 clusters. This will allow for comparison of prediction models based on the different number of clusters later in this report.
+
+### K-Means: 4 Clusters
+
+```{r, echo=FALSE}
+# K-Means: 4 Clusters
+neuron.df$session = as.factor(neuron.df$session)
+
+df.oh = one_hot(as.data.table(subset(neuron.df, select = -c(session))))
+```
+
+```{r, echo=FALSE}
+df.oh = df.oh %>% as.data.frame()
+df.oh.scaled = df.oh %>% scale()
+```
+
+```{r, echo=FALSE}
+set.seed(1)
+fitk4 = kmeans(x = df.oh.scaled, center = 4, nstart = 100)
+```
+
+
+After performing K-means clustering with a center of 4, 4 clusters were determined with sizes 531, 60, 2444, and 13270.
+
+```{r, echo=FALSE}
+fitk4$size
+```
+
+The cluster means for the first 6 time bins (out of 320 time bins) for the K-Means 4 Cluster results can be looked into again. It appears that the fourth cluster of neurons shows the lowest average firing rates across time bins for each decision type and feedback outcome combination, as compared to the average firing rates for the three other clusters. The second cluster of neurons in these results also shows the highest average firing rates across time bins for the decision type and feedback outcome combinations, being much higher than any of the other cluster means. The third cluster of neurons shows average firing rates being similar but slightly higher than those of the fourth cluster. The first cluster of neurons shows average firing rates across time bins being in the middle of all the other clusters, but still much lower than those the second cluster. Again, the actual values of the cluster means should not be interpreted directly, as the cluster means are computed from the scaled data.  
+
+```{r, echo=FALSE}
+fitk4$centers[,1:6]
+```
+
+The cluster vector (containing the cluster number for each neuron in this dataset) can be extracted and binded to the neuron dataframe again. This will allow for further analysis of neuron firing rates in the 4 clusters.
+
+```{r, echo=FALSE}
+df.k4 = cbind(neuron.df, fitk4$cluster)
+colnames(df.k4)[322] = "cluster"
+df.k4$cluster = as.factor(df.k4$cluster)
+```
+
+Once again, to visualize the similarities in firing rates among neurons in the same clusters, 3000 random neurons can be picked to be graphed over the 320 time bins.
+
+```{r, echo=FALSE}
+set.seed(123)
+df.k4.subsample = df.k4[sample(nrow(df.k4),3000),]
+```
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,320),ylim=c(0,2), xlab="Time Bins" ,ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate with 4 Clusters"))
+
+for(i in 1:300){
+  if(df.k4.subsample[i,]$cluster == 1) {
+    line.col = 'green'
+  }
+  else if (df.k4.subsample[i,]$cluster == 2){
+    line.col = 'blue'
+  }
+  else if (df.k4.subsample[i,]$cluster == 3){
+    line.col = 'red'
+  }
+  else {
+    line.col = 'purple'
+  }
+  lines(as.numeric(df.k4.subsample[i,][-c(321,322)]), type = 'l', col=line.col)
+}
+
+abline(v=c(41,81,121,161,201,241,281), col=c("black", "black","black","black","black","black","black"), lty=c(2,2,2,2,2,2,2), lwd=c(1,1,1,1,1,1,1))
+
+legend("topleft", legend = c("Cluster 1", "Cluster 2", "Cluster 3", "Cluster 4"), 
+       col = c("green","blue", "red", "purple"), 
+       lty = 1)
+```
+
+In this plot, neurons in the same cluster also have similar neural activity and trends across decision and feedback combinations. Neurons in Cluster 4 have the lowest activity, with their average neural spikes (in purple) found to be very low on the graph. Cluster 3 neurons, seen in red, have higher neural activity than those in Cluster 4, then followed by Cluster 1 neurons, seen in green. Cluster 2 has neurons with the highest neural activity, with average neural spikes being higher than those of the other clusters. However, it seems that the gap between firing rates for neurons in Cluster 2 and Cluster 1 are smaller than in the K-Means results for 3 clusters.
+
+
+# Section 3: Data Integration
+
+For Data Integration, two separate dataframes will be built to incorporate the results from the different K-Means clustering methods into trial information. 
+
+### 3 Clusters
+
+The first dataframe will be created with neuron activity incorporated based on the results of the K-Means clustering for 3 clusters. With a cluster type assigned to each neuron, it is now possible to compute the average firing rate for neurons in a cluster, in each trial. In the first new dataframe, each row will contain information for each trial in each session. The trial information contained in each row will include trial number, session number, feedback type, and decision type. Each row will also contain the average firing rate over 40 time bins for the neurons in each cluster that are present in that trial. As this dataset incorporates neuron information based on 3 clusters, a vector of 120 time bins will be included in the row for each trial, with 40 time bins for each neuron cluster firing rate averages. This new dataframe will have the dimensions of 5081 rows, the total number of trials in these experiments, by 124 columns (with the four key trial identifiers listed above, as well as the 120 time bins explained above).
+
+```{r, echo=FALSE}
+# get df for all neurons in trial with cluster column
+trial.neuron.df = function(session.num, trial.num, neuron.num) {
+  # initialize empty dataframe
+  neuron.trial = data.frame(bin1=integer(), bin2=integer(), bin3=integer(), bin4=integer(), bin5=integer(), bin6=integer(), bin7=integer(), bin8=integer(), bin9=integer(), bin10=integer(), bin11=integer(), bin12=integer(), bin13=integer(), bin14=integer(), bin15=integer(), bin16=integer(), bin17=integer(), bin18=integer(), bin19=integer(), bin20=integer(), bin21=integer(), bin22=integer(), bin23=integer(), bin24=integer(), bin25=integer(), bin26=integer(), bin27=integer(), bin28=integer(), bin29=integer(), bin30=integer(), bin31=integer(), bin32=integer(), bin33=integer(), bin34=integer(), bin35=integer(), bin36=integer(), bin37=integer(), bin38=integer(), bin39=integer(), bin40=integer(), session=integer(), trial=integer())
+  
+  # create matrix with vectors of all neurons (per 40 time bins) in a given trial (all neurons across one trials in a matrix) - bc in each trial, column values won't have avgs yet (only 1s and 0s)
+  for (i in 1:neuron.num) {
+    neuron.trial.vec = session[[session.num]]$spks[[trial.num]][i,]
+    neuron.trial.vec = c(neuron.trial.vec, c(session.num), c(trial.num))
+    neuron.trial[i,] = neuron.trial.vec # add neuron vector to overall neuron trial matrix
+  }
+  
+  neuron.trial = cbind("cluster" = (subset(df.k3, session == session.num))$cluster, neuron.trial)
+  
+  return(neuron.trial)
+}
+```
+
+
+```{r, echo=FALSE}
+# get trial avgs per cluster
+trial.avg.k3.vecs = function(neuron.trial.df) {
+  neuron.trial.df$cluster = as.numeric(neuron.trial.df$cluster)
+  neuron.trial.df.cluster1 = subset(neuron.trial.df, cluster == 1)
+  neuron.trial.df.cluster2 = subset(neuron.trial.df, cluster == 2)
+  neuron.trial.df.cluster3 = subset(neuron.trial.df, cluster == 3)
+  neuron.trial.df.cluster1.avg = colMeans(subset(neuron.trial.df.cluster1, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster2.avg = colMeans(subset(neuron.trial.df.cluster2, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster3.avg = colMeans(subset(neuron.trial.df.cluster3, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster.vec = c(as.vector(neuron.trial.df.cluster1.avg), as.vector(neuron.trial.df.cluster2.avg), as.vector(neuron.trial.df.cluster3.avg))
+  return(neuron.trial.df.cluster.vec)
+}
+```
+
+
+```{r, echo=FALSE}
+# create df for a session - all trials
+session.neuron.k3.df = function(session.num) {
+  session.df = data.frame(matrix(ncol = 124, nrow = 0))
+  for (i in 1:length(session[[session.num]]$spks)) { # 1:number of trials
+    # decision:
+    if (session[[session.num]]$contrast_left[i] > session[[session.num]]$contrast_right[i]){
+      decision = c(1)# right contrast < left contrast --> decision 1
+    }else if (session[[session.num]]$contrast_left[i] < session[[session.num]]$contrast_right[i]){
+      decision = c(2) # right contrast > left contrast --> decision 2
+    }else if (session[[session.num]]$contrast_left[i] == session[[session.num]]$contrast_right[i] 
+                   & session[[session.num]]$contrast_left[i] == 0){
+      decision = c(3) # left contrast = right contrast = 0 --> decision 3
+    }else{  # left contrast = right contrast != 0 --> decision 4
+      decision = c(4)
+    }
+    # calling trial df fcn: get.trial.neuron.df = function(session.num, trial.num, neuron.num)
+    trial.cluster.avgs.vec = trial.avg.k3.vecs(trial.neuron.df(session.num, i, length(session[[session.num]]$brain_area))) # 120 elem vector
+    session.trial.vec = c(session.num, i, session[[session.num]]$feedback_type[i], decision, as.vector(trial.cluster.avgs.vec)) # overall vector for a trial in a session
+    session.df[i,] = session.trial.vec
+  }
+  colnames(session.df)[1] = "session"
+  colnames(session.df)[2] = "trial"
+  colnames(session.df)[3] = "feedback"
+  colnames(session.df)[4] = "decision"
+  return(session.df)
+}
+```
+
+
+```{r, echo=FALSE}
+# create empty list to store the data frames
+neuron.k3.sessions.list = list()
+
+for (i in 1:18) {
+  data = session.neuron.k3.df(i)
+  
+  # assign a name to data frame
+  df_name = paste0("neuron.session.", i)
+  
+  # store the data frame in a list (of all session dfs)
+  neuron.k3.sessions.list[[df_name]] = data
+}
+```
+
+```{r, echo=FALSE}
+df.neuron.k3 = bind_rows(neuron.k3.sessions.list)
+```
+
+```{r, echo=FALSE}
+df.neuron.k3$feedback = as.factor(df.neuron.k3$feedback)
+```
+
+As this dataset averages firing rates over neurons in each cluster for every trial, it requires neurons from every cluster to be present in each trial (and each session). To take into account the possibility that some sessions may not have neurons present in each cluster type, due to small cluster size, NA values generated by this occurrence will be filled with the value 0. If there are no neurons present in a cluster type for a session, then the average firing rate for neurons in that cluster will be 0 across the 40 time bins.
+
+```{r, echo=FALSE}
+df.neuron.k3[is.na(df.neuron.k3)] = 0
+```
+
+The neuron firing rates averaged over each decision and feedback type can be visualized again, but now split between cluster types.
+
+```{r, echo=FALSE}
+# create subsets of data, for all 4 different cases - avg subsets to create four 40 vectors
+df.neuron.dec1.failure = subset(df.neuron.k3, decision == '1' & feedback == '-1')
+df.neuron.dec1.success = subset(df.neuron.k3, decision == '1' & feedback == '1')
+
+df.neuron.dec2.failure = subset(df.neuron.k3, decision == '2' & feedback == '-1')
+df.neuron.dec2.success = subset(df.neuron.k3, decision == '2' & feedback == '1')
+
+df.neuron.dec3.failure = subset(df.neuron.k3, decision == '3' & feedback == '-1')
+df.neuron.dec3.success = subset(df.neuron.k3, decision == '3' & feedback == '1')
+
+df.neuron.dec4.failure = subset(df.neuron.k3, decision == '4' & feedback == '-1')
+df.neuron.dec4.success = subset(df.neuron.k3, decision == '4' & feedback == '1')
+
+avg.neuron.dec1.failure = colMeans(subset(df.neuron.dec1.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec1.success = colMeans(subset(df.neuron.dec1.success, select = -c(feedback, trial, session, decision)))
+
+avg.neuron.dec2.failure = colMeans(subset(df.neuron.dec2.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec2.success = colMeans(subset(df.neuron.dec2.success, select = -c(feedback, trial, session, decision)))
+
+avg.neuron.dec3.failure = colMeans(subset(df.neuron.dec3.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec3.success = colMeans(subset(df.neuron.dec3.success, select = -c(feedback, trial, session, decision)))
+
+avg.neuron.dec4.failure = colMeans(subset(df.neuron.dec4.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec4.success = colMeans(subset(df.neuron.dec4.success, select = -c(feedback, trial, session, decision)))
+```
+
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,120),ylim=c(0,0.5), xlab="Time Bins (Cluster 1: 1-40, Cluster 2: 41-80, Cluster 3: 81-120)",ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate per Time Bin"))
+
+lines(avg.neuron.dec1.failure, type='l', col = 'blue', lty = 2)
+lines(avg.neuron.dec1.success, type='l', col = 'blue')
+lines(avg.neuron.dec2.failure, type='l', col = 'red', lty = 2)
+lines(avg.neuron.dec2.success, type='l', col = 'red')
+lines(avg.neuron.dec3.failure, type='l', col = 'green', lty = 2)
+lines(avg.neuron.dec3.success, type='l', col = 'green')
+lines(avg.neuron.dec4.failure, type='l', col = 'purple', lty = 2)
+lines(avg.neuron.dec4.success, type='l', col = 'purple')
+abline(v=c(41,81), col=c("black", "black"), lty=c(2,2), lwd=c(1, 1))
+
+
+legend("topright", legend = c("Decision 1", "Decision 2", "Decision 3", "Decision 4"), 
+       col = c("blue", "red", "green", "purple"), 
+       lty = 1)
+```
+
+As seen in the K-means clustering results for 3 centers, particularly in the cluster means, Cluster 2 shows very high neural activity as compared to Cluster 1 and 3. It can still be seen that Cluster 1 has higher firing rate levels than Cluster 3, which has firing rate levels near 0.
+
+The difference of the success and failure vectors can be plotted again for each decision type.
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,120),ylim=c(-0.05,0.1), xlab="Time Bins (Cluster 1: 1-40, Cluster 2: 41-80, Cluster 3: 81-120)",ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate per Time Bin"))
+
+lines(avg.neuron.dec1.success-avg.neuron.dec1.failure, type='l', col = 'blue')
+#lines(avg.dec1.success, type='l', col = 'blue')
+lines(avg.neuron.dec2.success-avg.neuron.dec2.failure, type='l', col = 'red')
+#lines(avg.dec2.success, type='l', col = 'red')
+lines(avg.neuron.dec3.success-avg.neuron.dec3.failure, type='l', col = 'green')
+#lines(avg.dec3.success, type='l', col = 'green')
+lines(avg.neuron.dec4.success-avg.neuron.dec4.failure, type='l', col = 'purple')
+#lines(avg.dec4.success, type='l', col = 'purple')
+abline(v=c(41,81), col=c("black", "black"), lty=c(2,2), lwd=c(1, 1))
+
+legend("topright", legend = c("Decision 1", "Decision 2", "Decision 3", "Decision 4"), 
+       col = c("blue", "red", "green", "purple"), 
+       lty = 1)
+```
+
+In this plot, we can look at the difference in neural activity in each cluster, for 3 clusters. 
+
+In Cluster 1, we see fairly similar patterns as the initial decision success and failure difference plot (before clustering). Decision 3 and Decision 4 saw the "flattest" and lowest differences (Decision 3 having the lowest) across the 40 time bins. However, though we see Decision 1 and 2 still following similar difference patterns, there is a larger gap between the difference curves with Decision 2 having greater firing rate levels. The curves for Decisions 1 and 2 appear to flatten after about 20 time bins, with slight sloping down from Decision 2.
+
+In Cluster 2, there are much higher levels of neural activity, as well as more spiking in activity, having higher peaks and lower troughs than any curves in the other clusters. We can still see similar overall trends in these curves, with Decision 3 and Decision 4 having generally flatter trends in their difference curves across the 40 time bins, with Decision 3 still having lower neural activity than Decision 4. For Decision 1 and 2, both curves follow a similar pattern as seen previously, however with a larger dip around the 10 time bin mark (time bin 50 in the graph). The two curves again appear to flatten after 20 time bins, still with spiking, though Decision 1 sees slight sloping down in this cluster. 
+
+In Cluster 3, the lowest neural activity is seen, with all difference curves lying near 0. It seems that Decision 3 may still have the lowest and flattest difference curve, followed by Decision 3, and also seeing  similar patterns in the curves for Decision 1 and 2.
+
+### 4 Clusters
+
+The second dataframe will be created with neuron activity incorporated based on the results of the K-Means clustering for 4 clusters. In the second new dataframe, each row will still contain information for each trial in each session, including trial number, session number, feedback type, and decision type. Each row will also contain the average firing rate over 40 time bins for the neurons in each cluster that are present in that trial. As this dataset incorporates neuron information based on 4 clusters, a vector of 160 time bins will be included in the row for each trial, with 40 time bins for each neuron cluster firing rate average. This new dataframe will have the dimensions of 5081 rows, the total number of trials in these experiments, by 164 columns (with the four key trial identifiers listed above, as well as the 160 time bins explained above).
+
+```{r, echo=FALSE}
+# get df for all neurons in trial with cluster column
+trial.neuron.df = function(session.num, trial.num, neuron.num) {
+  # initialize empty dataframe
+  neuron.trial = data.frame(bin1=integer(), bin2=integer(), bin3=integer(), bin4=integer(), bin5=integer(), bin6=integer(), bin7=integer(), bin8=integer(), bin9=integer(), bin10=integer(), bin11=integer(), bin12=integer(), bin13=integer(), bin14=integer(), bin15=integer(), bin16=integer(), bin17=integer(), bin18=integer(), bin19=integer(), bin20=integer(), bin21=integer(), bin22=integer(), bin23=integer(), bin24=integer(), bin25=integer(), bin26=integer(), bin27=integer(), bin28=integer(), bin29=integer(), bin30=integer(), bin31=integer(), bin32=integer(), bin33=integer(), bin34=integer(), bin35=integer(), bin36=integer(), bin37=integer(), bin38=integer(), bin39=integer(), bin40=integer(), session=integer(), trial=integer())
+  
+  # create matrix with vectors of all neurons (per 40 time bins) in a given trial (all neurons across one trials in a matrix) - bc in each trial, column values won't have avgs yet (only 1s and 0s)
+  for (i in 1:neuron.num) {
+    neuron.trial.vec = session[[session.num]]$spks[[trial.num]][i,]
+    neuron.trial.vec = c(neuron.trial.vec, c(session.num), c(trial.num))
+    neuron.trial[i,] = neuron.trial.vec # add neuron vector to overall neuron trial matrix
+  }
+  
+  neuron.trial = cbind("cluster" = (subset(df.k4, session == session.num))$cluster, neuron.trial)
+  
+  return(neuron.trial)
+}
+```
+
+```{r, echo=FALSE}
+# get trial avgs per cluster
+trial.avg.k4.vecs = function(neuron.trial.df) {
+  neuron.trial.df$cluster = as.numeric(neuron.trial.df$cluster)
+  neuron.trial.df.cluster1 = subset(neuron.trial.df, cluster == 1)
+  neuron.trial.df.cluster2 = subset(neuron.trial.df, cluster == 2)
+  neuron.trial.df.cluster3 = subset(neuron.trial.df, cluster == 3)
+  neuron.trial.df.cluster4 = subset(neuron.trial.df, cluster == 4)
+  neuron.trial.df.cluster1.avg = colMeans(subset(neuron.trial.df.cluster1, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster2.avg = colMeans(subset(neuron.trial.df.cluster2, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster3.avg = colMeans(subset(neuron.trial.df.cluster3, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster4.avg = colMeans(subset(neuron.trial.df.cluster4, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster.vec = c(as.vector(neuron.trial.df.cluster1.avg), as.vector(neuron.trial.df.cluster2.avg), as.vector(neuron.trial.df.cluster3.avg), as.vector(neuron.trial.df.cluster4.avg))
+  #neuron.trial.df.cluster.vec
+  return(neuron.trial.df.cluster.vec)
+}
+```
+
+```{r, echo=FALSE}
+# create df for session 1 - all trials
+session.neuron.k4.df = function(session.num) {
+  session.df = data.frame(matrix(ncol = 164, nrow = 0))
+  for (i in 1:length(session[[session.num]]$spks)) { # 1:number of trials
+    # decision:
+    if (session[[session.num]]$contrast_left[i] > session[[session.num]]$contrast_right[i]){
+      decision = c(1)# right contrast < left contrast --> decision 1
+    }else if (session[[session.num]]$contrast_left[i] < session[[session.num]]$contrast_right[i]){
+      decision = c(2) # right contrast > left contrast --> decision 2
+    }else if (session[[session.num]]$contrast_left[i] == session[[session.num]]$contrast_right[i] 
+                   & session[[session.num]]$contrast_left[i] == 0){
+      decision = c(3) # left contrast = right contrast = 0 --> decision 3
+    }else{  # left contrast = right contrast != 0 --> decision 4
+      decision = c(4)
+    }
+    # calling trial df fcn: get.trial.neuron.df = function(session.num, trial.num, neuron.num)
+    trial.cluster.avgs.vec = trial.avg.k4.vecs(trial.neuron.df(session.num, i, length(session[[session.num]]$brain_area))) # 160 elem vector
+    session.trial.vec = c(session.num, i, session[[session.num]]$feedback_type[i], decision, as.vector(trial.cluster.avgs.vec)) # overall vector for a trial in a session
+    session.df[i,] = session.trial.vec
+  }
+  colnames(session.df)[1] = "session"
+  colnames(session.df)[2] = "trial"
+  colnames(session.df)[3] = "feedback"
+  colnames(session.df)[4] = "decision"
+  #session.df[is.na(session.df)] = 0
+  return(session.df)
+}
+```
+
+```{r, echo=FALSE}
+# create empty list to store the data frames
+neuron.k4.sessions.list = list()
+
+for (i in 1:18) {
+  data = session.neuron.k4.df(i)
+  
+  # assign a name to data frame
+  df_name = paste0("neuron.session.", i)
+  
+  # store the data frame in a list (of all session dfs)
+  neuron.k4.sessions.list[[df_name]] = data
+}
+```
+
+```{r, echo=FALSE}
+df.neuron.k4 = bind_rows(neuron.k4.sessions.list)
+```
+
+```{r, echo=FALSE}
+df.neuron.k4$feedback = as.factor(df.neuron.k4$feedback)
+```
+
+```{r, echo=FALSE}
+df.neuron.k4[is.na(df.neuron.k4)] = 0
+```
+
+The neuron firing rates averaged over each decision and feedback type can be visualized again, but now split between cluster types for 4 clusters.
+
+```{r, echo=FALSE}
+# create subsets of data, for all 4 different cases - avg subsets to create four 40 vectors
+df.neuron.dec1.failure = subset(df.neuron.k4, decision == '1' & feedback == '-1')
+df.neuron.dec1.success = subset(df.neuron.k4, decision == '1' & feedback == '1')
+
+df.neuron.dec2.failure = subset(df.neuron.k4, decision == '2' & feedback == '-1')
+df.neuron.dec2.success = subset(df.neuron.k4, decision == '2' & feedback == '1')
+
+df.neuron.dec3.failure = subset(df.neuron.k4, decision == '3' & feedback == '-1')
+df.neuron.dec3.success = subset(df.neuron.k4, decision == '3' & feedback == '1')
+
+df.neuron.dec4.failure = subset(df.neuron.k4, decision == '4' & feedback == '-1')
+df.neuron.dec4.success = subset(df.neuron.k4, decision == '4' & feedback == '1')
+
+avg.neuron.dec1.failure = colMeans(subset(df.neuron.dec1.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec1.success = colMeans(subset(df.neuron.dec1.success, select = -c(feedback, trial, session, decision)))
+
+avg.neuron.dec2.failure = colMeans(subset(df.neuron.dec2.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec2.success = colMeans(subset(df.neuron.dec2.success, select = -c(feedback, trial, session, decision)))
+
+avg.neuron.dec3.failure = colMeans(subset(df.neuron.dec3.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec3.success = colMeans(subset(df.neuron.dec3.success, select = -c(feedback, trial, session, decision)))
+
+avg.neuron.dec4.failure = colMeans(subset(df.neuron.dec4.failure, select = -c(feedback, trial, session, decision)))
+avg.neuron.dec4.success = colMeans(subset(df.neuron.dec4.success, select = -c(feedback, trial, session, decision)))
+```
+
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,160),ylim=c(0,0.8), xlab="Time Bins (Cluster 1: 1-40, Cluster 2: 41-80, Cluster 3: 81-120, Cluster 4: 121-160)",ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate per Time Bin"))
+
+lines(avg.neuron.dec1.failure, type='l', col = 'blue', lty = 2)
+lines(avg.neuron.dec1.success, type='l', col = 'blue')
+lines(avg.neuron.dec2.failure, type='l', col = 'red', lty = 2)
+lines(avg.neuron.dec2.success, type='l', col = 'red')
+lines(avg.neuron.dec3.failure, type='l', col = 'green', lty = 2)
+lines(avg.neuron.dec3.success, type='l', col = 'green')
+lines(avg.neuron.dec4.failure, type='l', col = 'purple', lty = 2)
+lines(avg.neuron.dec4.success, type='l', col = 'purple')
+abline(v=c(41,81,121), col=c("black", "black", "black"), lty=c(2,2,2), lwd=c(1, 1, 1))
+
+
+legend("topright", legend = c("Decision 1", "Decision 2", "Decision 3", "Decision 4"), 
+       col = c("blue", "red", "green", "purple"), 
+       lty = 1)
+```
+
+As seen in the K-means clustering results for 4 centers, particularly in the cluster means, Cluster 2 shows very high neural activity as compared to all other clusters. It can still be seen that Cluster 1 has higher firing rate levels than Clusters 3 and 4. Cluster 3 and 4 have firing rate levels near 0, with those of Cluster 4 being slightly higher.
+
+
+The difference of the success and failure firing rates can be plotted again for each decision type.
+
+```{r, echo=FALSE}
+# initiate blank plot before drawing anything on it
+plot(x=0,y=0, col='white',xlim=c(0,160),ylim=c(-0.1,0.2), xlab="Time Bins (Cluster 1: 1-40, Cluster 2: 41-80, Cluster 3: 81-120, Cluster 4: 121-160)",ylab="Neuron Firing Rate", main=paste("Average Neuron Firing Rate per Time Bin"))
+
+lines(avg.neuron.dec1.success-avg.neuron.dec1.failure, type='l', col = 'blue')
+#lines(avg.dec1.success, type='l', col = 'blue')
+lines(avg.neuron.dec2.success-avg.neuron.dec2.failure, type='l', col = 'red')
+#lines(avg.dec2.success, type='l', col = 'red')
+lines(avg.neuron.dec3.success-avg.neuron.dec3.failure, type='l', col = 'green')
+#lines(avg.dec3.success, type='l', col = 'green')
+lines(avg.neuron.dec4.success-avg.neuron.dec4.failure, type='l', col = 'purple')
+#lines(avg.dec4.success, type='l', col = 'purple')
+abline(v=c(41,81,121), col=c("black", "black", "black"), lty=c(2,2,2), lwd=c(1, 1, 1))
+
+legend("topright", legend = c("Decision 1", "Decision 2", "Decision 3", "Decision 4"), 
+       col = c("blue", "red", "green", "purple"), 
+       lty = 1)
+```
+
+In this plot, we can look at the differences in neural activity between each cluster for 4 clusters. 
+
+In Cluster 1, there are fairly similar patterns as the initial decision success and failure difference plot (before any clustering). Decision 3 and Decision 4 saw the most constant and lowest differences (Decision 3 having the lowest) across the 40 time bins. Though we see Decision 1 and 2 still following similar difference patterns, there is again a larger gap between the difference curves and Decision 2 continues to have greater levels. The curves for Decisions 1 and 2 generally flatten after the first 20 time bins.
+
+In Cluster 2, there are much higher levels of neural activity, as well as greater spiking in activity, similar to what is seen in this plot for 3 clusters. Similar trends can be seen in these curves, Decision 3 and Decision 4 having generally flatter trends in their difference curves across the 40 time bins, with Decision 3 still having lower neural activity than Decision 4. For Decision 1 and 2, both curves follow a similar pattern as seen previously, this time without a larger dip around the 10 time bin mark as seen in this plot for 3 clusters. The two curves again appear to relatively flatten after 20 time bins, still with spiking. 
+
+In Cluster 3, one can see similar patterns to the initial decision success and failure difference plot (before any clustering), like for Cluster 1, but at overall lower neuron firing rate levels. In Cluster 4, the lowest neural activity is seen, with all difference curves near 0 and the differences for each decision difficult to interpret.  
+
+# Section 4: Predictive Modeling
+
+### 3 Clusters
+
+From the dataset that incorporates K-Means clustering with 3 clusters, logistic regression models can be created to predict feedback outcome. Three models will be created, with one model trained and tested on trials that fall under Decision 1 and 2, a second model for Decision 3 trials, and a third model for Decision 4 trials.
+
+Since similarities were seen between the difference curve patterns and firing rates of Decisions 1 and 2, and these two decision types have a similar method of determining success and failure, a model will be created that is trained and tested on trial data from both decisions. However, the data will be subsetted according to time bins, leaving off the first 20 time bins to capture the constant differences between success and failure neuron firing rates.
+
+Decisions 1 and 2:
+
+```{r, echo=FALSE}
+df.k3.dec1 = subset(df.neuron.k3, decision == 1)
+df.k3.dec2 = subset(df.neuron.k3, decision == 2)
+df.k3.dec12 = bind_rows(df.k3.dec1, df.k3.dec2)
+df.k3.dec12 = df.k3.dec12[-c(5:24,45:64)]
+```
+
+```{r, echo=FALSE}
+# Split into test and train data
+# Split data into train and test
+set.seed(101) # Set Seed so that same sample can be reproduced in future also
+
+df.k3.dec12.nodecision = subset(df.k3.dec12, select = -c(decision))
+
+# Selecting 80% of data as sample from total 'n' rows of the data  
+sample = sample.int(n = nrow(df.k3.dec12.nodecision), size = floor(.8 * nrow(df.k3.dec12.nodecision)), replace = F)
+train.k3.12 = df.k3.dec12.nodecision[sample, ]
+test.k3.12 = df.k3.dec12.nodecision[-sample, ]
+```
+
+```{r, echo=FALSE}
+fit.k3.dec12 = glm(feedback~., data = train.k3.12, family="binomial")
+```
+
+```{r, echo=FALSE}
+pred.k3.dec12 = predict(fit.k3.dec12, subset(test.k3.12, select = -c(feedback)), type = 'response')
+prediction.k3.dec12 = factor(pred.k3.dec12 > 0.5, labels = c('-1', '1'))
+mean(prediction.k3.dec12 != test.k3.12$feedback)
+```
+
+The Logistic Regression model for Decision 1 and 2 data has a 0.2018 error rate on the test data.
+
+Decision 3:
+
+```{r, echo=FALSE}
+df.k3.dec3 = subset(df.neuron.k3, decision == '3')
+```
+
+```{r, echo=FALSE}
+# Split into test and train data
+# Split data into train and test
+set.seed(101) # Set Seed so that same sample can be reproduced in future also
+
+df.k3.dec3.nodecision = subset(df.k3.dec3, select = -c(decision))
+
+# Selecting 80% of data as sample from total 'n' rows of the data  
+sample = sample.int(n = nrow(df.k3.dec3.nodecision), size = floor(.8 * nrow(df.k3.dec3.nodecision)), replace = F)
+train.k3.3 = df.k3.dec3.nodecision[sample, ]
+test.k3.3 = df.k3.dec3.nodecision[-sample, ]
+```
+
+```{r, echo=FALSE}
+fit.k3.dec3 = glm(feedback~., data = train.k3.3, family="binomial")
+```
+
+```{r, echo=FALSE}
+pred.k3.dec3 = predict(fit.k3.dec3, subset(test.k3.3, select = -c(feedback)), type = 'response')
+prediction.k3.dec3 = factor(pred.k3.dec3 > 0.5, labels = c('-1', '1'))
+mean(prediction.k3.dec3 != test.k3.3$feedback)
+```
+
+The Logistic Regression model has a 0.4073 error rate for Decision 3 test data.
+
+Decision 4:
+
+```{r, echo=FALSE}
+df.k3.dec4 = subset(df.neuron.k3, decision == '4')
+```
+
+```{r, echo=FALSE}
+# Split into test and train data
+# Split data into train and test
+set.seed(101) # Set Seed so that same sample can be reproduced in future also
+
+df.k3.dec4.nodecision = subset(df.k3.dec4, select = -c(decision))
+
+# Selecting 80% of data as sample from total 'n' rows of the data  
+sample = sample.int(n = nrow(df.k3.dec4.nodecision), size = floor(.8 * nrow(df.k3.dec4.nodecision)), replace = F)
+train.k3.4 = df.k3.dec4.nodecision[sample, ]
+test.k3.4 = df.k3.dec4.nodecision[-sample, ]
+```
+
+```{r, echo=FALSE, message=FALSE}
+suppressWarnings({ 
+  fit.k3.dec4 = glm(feedback~., data = train.k3.4, family="binomial")
+}) 
+```
+
+```{r, echo=FALSE}
+pred.k3.dec4 = predict(fit.k3.dec4, subset(test.k3.4, select = -c(feedback)), type = 'response')
+prediction.k3.dec4 = factor(pred.k3.dec4 > 0.5, labels = c('-1', '1'))
+mean(prediction.k3.dec4 != test.k3.4$feedback)
+```
+
+The Logistic Regression model has a 0.4603 error rate for Decision 4 test data.
+
+
+XGBoost can also be used for the same predictive modeling purposes as Logistic Regression. 
+
+Decision 1 and 2: 
+
+```{r, echo=FALSE}
+fit.k3.dec12.xg = xgboost(data = model.matrix(fit.k3.dec12)[,-1], label = as.numeric(train.k3.12$feedback)-1,
+                     max.depth = 5, eta = 1, nthread = 2, nrounds = 5, 
+                     objective = "binary:logistic")
+```
+
+```{r, echo=FALSE}
+fit_tmp = glm(feedback~., data = test.k3.12, family="binomial") # to obtain model matrix
+```
+
+```{r, echo=FALSE}
+pred.k3.dec12.xg = predict(fit.k3.dec12.xg, model.matrix(fit_tmp)[,-1])
+prediction.k3.dec12.xg = factor(pred.k3.dec12.xg > 0.5, labels = c('-1', '1'))
+mean(prediction.k3.dec12.xg != test.k3.12$feedback)
+```
+
+The XGBoost model shows an error rate of 0.2725 on the Decision 1 and 2 test data.
+
+
+Decision 3: 
+
+```{r, echo=FALSE}
+fit.k3.dec3.xg = xgboost(data = model.matrix(fit.k3.dec3)[,-1], label = as.numeric(train.k3.3$feedback)-1,
+                     max.depth = 5, eta = 1, nthread = 2, nrounds = 5, 
+                     objective = "binary:logistic")
+```
+
+```{r, echo=FALSE}
+fit_tmp = glm(feedback~., data = test.k3.3, family="binomial") # to obtain model matrix
+```
+
+```{r, echo=FALSE}
+pred.k3.dec3.xg = predict(fit.k3.dec3.xg, model.matrix(fit_tmp)[,-1])
+prediction.k3.dec3.xg = factor(pred.k3.dec3.xg > 0.5, labels = c('-1', '1'))
+mean(prediction.k3.dec3.xg != test.k3.3$feedback)
+```
+
+The XGBoost model has an error rate of 0.4 for Decision 3 test data.
+
+
+Decision 4: 
+
+```{r, echo=FALSE}
+fit.k3.dec4.xg = xgboost(data = model.matrix(fit.k3.dec4)[,-1], label = as.numeric(train.k3.4$feedback)-1,
+                     max.depth = 5, eta = 1, nthread = 2, nrounds = 5, 
+                     objective = "binary:logistic")
+```
+
+```{r, echo=FALSE}
+fit_tmp = glm(feedback~., data = test.k3.4, family="binomial") # to obtain model matrix
+```
+
+```{r, echo=FALSE}
+pred.k3.dec4.xg = predict(fit.k3.dec4.xg, model.matrix(fit_tmp)[,-1])
+prediction.k3.dec4.xg = factor(pred.k3.dec4.xg > 0.5, labels = c('-1', '1'))
+mean(prediction.k3.dec4.xg != test.k3.4$feedback)
+```
+
+The XGBoost model shows an error rate of 0.5079 for Decision 4 test data.
+
+
+### 4 Clusters
+
+From the dataset that incorporates K-Means clustering with 4 clusters, logistic regression models can be created again to predict feedback outcome. Three models will be created similar to previously, with one model trained and tested on trials that fall under Decision 1 and 2, a second model for Decision 3 trials, and a third model for Decision 4 trials.
+
+The model for Decisions 1 and 2 will have the first 20 time bins left off Clusters 1 and 2.
+
+Decisions 1 and 2:
+
+```{r, echo=FALSE}
+df.k4.dec1 = subset(df.neuron.k4, decision == 1)
+df.k4.dec2 = subset(df.neuron.k4, decision == 2)
+df.k4.dec12 = bind_rows(df.k4.dec1, df.k4.dec2)
+df.k4.dec12 = df.k4.dec12[-c(5:24,45:64)]
+```
+
+```{r, echo=FALSE}
+# Split into test and train data
+# Split data into train and test
+set.seed(101) # Set Seed so that same sample can be reproduced in future also
+
+df.k4.dec12.nodecision = subset(df.k4.dec12, select = -c(decision))
+
+# Selecting 80% of data as sample from total 'n' rows of the data  
+sample = sample.int(n = nrow(df.k4.dec12.nodecision), size = floor(.8 * nrow(df.k4.dec12.nodecision)), replace = F)
+train.k4.12 = df.k4.dec12.nodecision[sample, ]
+test.k4.12 = df.k4.dec12.nodecision[-sample, ]
+```
+
+```{r, echo=FALSE}
+fit.k4.dec12 = glm(feedback~., data = train.k4.12, family="binomial")
+```
+
+```{r, echo=FALSE}
+pred.k4.dec12 = predict(fit.k4.dec12, subset(test.k4.12, select = -c(feedback)), type = 'response')
+prediction.k4.dec12 = factor(pred.k4.dec12 > 0.5, labels = c('-1', '1'))
+mean(prediction.k4.dec12 != test.k4.12$feedback)
+```
+
+The Logistic Regression model for 4 clusters, for Decision 1 and 2 test data, has a 0.2121 error rate.
+
+Decision 3:
+
+```{r, echo=FALSE}
+df.k4.dec3 = subset(df.neuron.k4, decision == '3')
+```
+
+```{r, echo=FALSE}
+# Split into test and train data
+# Split data into train and test
+set.seed(101) # Set Seed so that same sample can be reproduced in future also
+
+df.k4.dec3.nodecision = subset(df.k4.dec3, select = -c(decision))
+
+# Selecting 80% of data as sample from total 'n' rows of the data  
+sample = sample.int(n = nrow(df.k4.dec3.nodecision), size = floor(.8 * nrow(df.k4.dec3.nodecision)), replace = F)
+train.k4.3 = df.k4.dec3.nodecision[sample, ]
+test.k4.3 = df.k4.dec3.nodecision[-sample, ]
+```
+
+```{r, echo=FALSE}
+fit.k4.dec3 = glm(feedback~., data = train.k4.3, family="binomial")
+```
+
+```{r, echo=FALSE}
+pred.k4.dec3 = predict(fit.k4.dec3, subset(test.k4.3, select = -c(feedback)), type = 'response')
+prediction.k4.dec3 = factor(pred.k4.dec3 > 0.5, labels = c('-1', '1'))
+mean(prediction.k4.dec3 != test.k4.3$feedback)
+```
+
+The Logistic Regression model has a 0.4 error rate for Decision 3 test data.
+
+Decision 4:
+
+```{r, echo=FALSE}
+df.k4.dec4 = subset(df.neuron.k4, decision == '4')
+```
+
+```{r, echo=FALSE}
+# Split into test and train data
+# Split data into train and test
+set.seed(101) # Set Seed so that same sample can be reproduced in future also
+
+df.k4.dec4.nodecision = subset(df.k4.dec4, select = -c(decision))
+
+# Select 80% of data as sample from total 'n' rows of the data  
+sample = sample.int(n = nrow(df.k4.dec4.nodecision), size = floor(.8 * nrow(df.k4.dec4.nodecision)), replace = F)
+train.k4.4 = df.k4.dec4.nodecision[sample, ]
+test.k4.4 = df.k4.dec4.nodecision[-sample, ]
+```
+
+```{r, echo=FALSE, message=FALSE}
+suppressWarnings({
+  fit.k4.dec4 = glm(feedback~., data = train.k4.4, family="binomial")
+})
+```
+
+```{r, echo=FALSE}
+pred.k4.dec4 = predict(fit.k4.dec4, subset(test.k4.4, select = -c(feedback)), type = 'response')
+prediction.k4.dec4 = factor(pred.k4.dec4 > 0.5, labels = c('-1', '1'))
+mean(prediction.k4.dec4 != test.k4.4$feedback)
+```
+
+The Logistic Regression model has a 0.4444 error rate for Decision 4 test data.
+
+
+It is also possible to create XGBoost models on the dataset that takes 4 clusters into account. 
+
+Decision 1 and 2: 
+
+```{r, echo=FALSE}
+fit.k4.dec12.xg = xgboost(data = model.matrix(fit.k4.dec12)[,-1], label = as.numeric(train.k4.12$feedback)-1,
+                     max.depth = 5, eta = 1, nthread = 2, nrounds = 5, 
+                     objective = "binary:logistic")
+```
+
+```{r, echo=FALSE}
+fit_tmp = glm(feedback~., data = test.k4.12, family="binomial") # to obtain model matrix
+```
+
+```{r, echo=FALSE}
+pred.k4.dec12.xg = predict(fit.k4.dec12.xg, model.matrix(fit_tmp)[,-1])
+prediction.k4.dec12.xg = factor(pred.k4.dec12.xg > 0.5, labels = c('-1', '1'))
+mean(prediction.k4.dec12.xg != test.k4.12$feedback)
+```
+
+The XGBoost model for 4 clusters shows an error rate of 0.2489 for Decisions 1 and 2 test data.
+
+
+Decision 3: 
+
+```{r, echo=FALSE}
+fit.k4.dec3.xg = xgboost(data = model.matrix(fit.k4.dec3)[,-1], label = as.numeric(train.k4.3$feedback)-1,
+                     max.depth = 5, eta = 1, nthread = 2, nrounds = 5, 
+                     objective = "binary:logistic")
+```
+
+```{r, echo=FALSE}
+suppressWarnings({
+  fit_tmp = glm(feedback~., data = test.k4.3, family="binomial") # to obtain model matrix
+})
+```
+
+```{r, echo=FALSE}
+pred.k4.dec3.xg = predict(fit.k4.dec3.xg, model.matrix(fit_tmp)[,-1])
+prediction.k4.dec3.xg = factor(pred.k4.dec3.xg > 0.5, labels = c('-1', '1'))
+mean(prediction.k4.dec3.xg != test.k4.3$feedback)
+```
+
+The XGBoost model for 4 clusters has an error rate of 0.3636 for Decision 3 test data.
+
+
+Decision 4: 
+
+```{r, echo=FALSE}
+fit.k4.dec4.xg = xgboost(data = model.matrix(fit.k4.dec4)[,-1], label = as.numeric(train.k4.4$feedback)-1,
+                     max.depth = 5, eta = 1, nthread = 2, nrounds = 5, 
+                     objective = "binary:logistic")
+```
+
+```{r, echo=FALSE}
+fit_tmp = glm(feedback~., data = test.k4.4, family="binomial") # to obtain model matrix
+```
+
+```{r, echo=FALSE}
+pred.k4.dec4.xg = predict(fit.k4.dec4.xg, model.matrix(fit_tmp)[,-1])
+prediction.k4.dec4.xg = factor(pred.k4.dec4.xg > 0.5, labels = c('-1', '1'))
+mean(prediction.k4.dec4.xg != test.k4.4$feedback)
+```
+
+The XGBoost model for 4 clusters on Decision 4 test data has an error rate of 0.5556.
+
+
+To compare the various models created for the data subsets (according to decision), the ROC curves can be graphed for each model.
+
+Decisions 1 and 2:
+
+```{r, echo=FALSE, message=FALSE}
+# K3 - Glm
+roc.k3.12.g = roc(test.k3.12$feedback, pred.k3.dec12) 
+
+# K3 - XGBoost
+roc.k3.12.x = roc(test.k3.12$feedback, pred.k3.dec12.xg) 
+
+# K4 - Glm
+roc.k4.12.g = roc(test.k4.12$feedback, pred.k4.dec12) 
+
+# K4 - XGBoost
+roc.k4.12.x = roc(test.k4.12$feedback, pred.k4.dec12.xg) 
+
+plot(roc.k3.12.g, col = 'red', main = 'ROC curve')
+plot(roc.k3.12.x, add = TRUE, col = 'blue')
+plot(roc.k4.12.g, add = TRUE, col = 'purple')
+plot(roc.k4.12.x, add = TRUE, col = 'orange')
+legend("bottomright", legend=c("K3 GLM", "K3 XGBoost", "K4 GLM", "K4 XGBoost"), col=c('red', 'blue', 'purple', 'orange'), lty=1:1, cex=0.8)
+```
+
+From the ROC curves, similar performance is seen by the XGBoost models and by Logistic Regression models, across the different clustered datasets. The Logistic Regression models for either the dataset with 3 or 4 clusters performed better than the XGBoost models for these datasets. The performance between the Logistic Regression models was very similar, as with the performance between the XGBoost models.
+
+```{r, echo=FALSE}
+# AUC 
+roc.12 = data.frame(Model = c("K3 GLM", "K3 XGBoost", "K4 GLM", "K4 XGBoost"),
+                    AUC = c(roc.k3.12.g$auc, roc.k3.12.x$auc, roc.k4.12.g$auc, roc.k4.12.x$auc))
+#print(c(roc.k3.12.g$auc, roc.k3.12.x$auc, roc.k4.12.g$auc, roc.k4.12.x$auc))
+kable(roc.12, format = "html", table.attr = "class='table table-striped'",digits=4) 
+```
+
+Similar results are seen from the AUC values. The Logistic Regression models have very similar performance, with the model for 3 clusters dataset performing slightly better than the dataset with 4 clusters. The XGBoost models also have very similar performance, but are both lower than the performances of the Logistic Regression models, and again the model for 3 clusters dataset performs slightly better than the dataset with 4 clusters.
+
+The best performing model for Decisions 1 and 2 was the Logistic Regression model trained on a dataset that incorporates K-Means clustering for 3 clusters.
+
+Decision 3:
+
+```{r, echo=FALSE, message=FALSE}
+# K3 - Glm
+roc.k3.3.g = roc(test.k3.3$feedback, pred.k3.dec3) 
+
+# K3 - XGBoost
+roc.k3.3.x = roc(test.k3.3$feedback, pred.k3.dec3.xg) 
+
+# K4 - Glm
+roc.k4.3.g = roc(test.k4.3$feedback, pred.k4.dec3) 
+
+# K4 - XGBoost
+roc.k4.3.x = roc(test.k4.3$feedback, pred.k4.dec3.xg) 
+
+plot(roc.k3.3.g, col = 'red', main = 'ROC curve')
+plot(roc.k3.3.x, add = TRUE, col = 'blue')
+plot(roc.k4.3.g, add = TRUE, col = 'purple')
+plot(roc.k4.3.x, add = TRUE, col = 'orange')
+legend("bottomright", legend=c("K3 GLM", "K3 XGBoost", "K4 GLM", "K4 XGBoost"), col=c('red', 'blue', 'purple', 'orange'), lty=1:1, cex=0.8)
+```
+
+
+From the ROC curves, performance by the different models seems to vary more in predicting data for Decision 3 than data for Decision 1 and 2. The Logistic Regression and XGBoost models for the dataset with 4 clusters seemed to perform better than those for the dataset with 3 clusters. It seems that the XGBoost models performed better than their Logistic Regression counterparts for each clustered dataset.
+
+```{r, echo=FALSE}
+# AUC 
+roc.3 = data.frame(Model = c("K3 GLM", "K3 XGBoost", "K4 GLM", "K4 XGBoost"),
+                    AUC = c(roc.k3.3.g$auc, roc.k3.3.x$auc, roc.k4.3.g$auc, roc.k4.3.x$auc))
+kable(roc.3, format = "html", table.attr = "class='table table-striped'",digits=4) 
+```
+Similar results are seen from the AUC values. The best performing model was the XGBoost model trained and tested on the dataset with 4 clusters, followed by the Logistic Regression model trained and tested on the dataset with 4 clusters. For the models trained and tested on the dataset with 3 clusters, the XGBoost model also performed better than the Logistic Regression model.
+
+The best performing model for Decision 3 was the XGBoost model trained on a dataset that incorporates K-Means clustering for 4 clusters.
+
+Decision 4:
+
+```{r, echo=FALSE, message=FALSE}
+# K3 - Glm
+roc.k3.4.g = roc(test.k3.4$feedback, pred.k3.dec4) 
+
+# K3 - XGBoost
+roc.k3.4.x = roc(test.k3.4$feedback, pred.k3.dec4.xg) 
+
+# K4 - Glm
+roc.k4.4.g = roc(test.k4.4$feedback, pred.k4.dec4) 
+
+# K4 - XGBoost
+roc.k4.4.x = roc(test.k4.4$feedback, pred.k4.dec4.xg) 
+
+plot(roc.k3.4.g, col = 'red', main = 'ROC curve')
+plot(roc.k3.4.x, add = TRUE, col = 'blue')
+plot(roc.k4.4.g, add = TRUE, col = 'purple')
+plot(roc.k4.4.x, add = TRUE, col = 'orange')
+legend("bottomright", legend=c("K3 GLM", "K3 XGBoost", "K4 GLM", "K4 XGBoost"), col=c('red', 'blue', 'purple', 'orange'), lty=1:1, cex=0.8)
+```
+
+From the ROC curves, performance by the different models again varies more in predicting data for Decision 4 than data for Decision 1 and 2. Models for Decision 4 also perform the lowest of models for all decision types. The Logistic Regression and XGBoost models for the dataset with 4 clusters seemed to perform better than those for the dataset with 3 clusters. However, the XGBoost models performed either similarly (4 clusters dataset) or worse (3 clusters dataset) than their Logistic Regression counterparts for each clustered dataset.
+
+```{r, echo=FALSE}
+# AUC 
+roc.4 = data.frame(Model = c("K3 GLM", "K3 XGBoost", "K4 GLM", "K4 XGBoost"),
+                    AUC = c(roc.k3.4.g$auc, roc.k3.4.x$auc, roc.k4.4.g$auc, roc.k4.4.x$auc))
+kable(roc.4, format = "html", table.attr = "class='table table-striped'",digits=4) 
+```
+
+Similar results are seen from the AUC values. The best performing models were the XGBoost and Logistic Regression models trained and tested on the dataset with 4 clusters, followed by the Logistic Regression model trained and tested on the dataset with 3 clusters. For the models trained and tested on the dataset with 3 clusters, the XGBoost model performed worse than the Logistic Regression model.
+
+The best performing model for Decision 4 was the Logistic Regression model trained on a dataset that incorporates K-Means clustering for 4 clusters.
+
+# Section 5: Prediction Performance on Test Sets
+
+```{r, echo=FALSE}
+setwd("/Users/zeevachaver/Documents/sta 141a/project")
+
+session=list()
+for(i in 1:2){
+  session[[i]]=readRDS(paste('./test/test',i,'.rds',sep=''))
+}
+```
+
+As clustering needs to be performed, first the dataset with each row representing a neuron will be created.
+
+```{r, echo=FALSE}
+test.neuron.df = get.neuron.df(2)
+```
+
+K-means clustering, first for 3 centers, will be performed on a subset of this dataset, not including the session ID column. This subset will be one-hot encoded and scaled before performing K-means clustering.
+
+```{r, echo=FALSE}
+# K-means: 3 Clusters
+test.neuron.df$session = as.factor(test.neuron.df$session)
+df.oh = one_hot(as.data.table(subset(test.neuron.df, select = -c(session))))
+```
+
+```{r, echo=FALSE}
+df.oh = df.oh %>% as.data.frame()
+df.oh.scaled = df.oh %>% scale()
+```
+
+```{r, echo=FALSE}
+set.seed(1)
+test.fitk3 = kmeans(x = df.oh.scaled, center = 3, nstart = 100)
+```
+
+The cluster vector for 3 clusters (containing the cluster number for each neuron in this dataset) will be extracted and binded to the test neuron dataset. 
+
+```{r, echo=FALSE}
+test.df.k3 = cbind(test.neuron.df, test.fitk3$cluster)
+colnames(test.df.k3)[322] = "cluster"
+test.df.k3$cluster = as.factor(test.df.k3$cluster)
+```
+
+K-means clustering, for 4 centers, will be performed on a subset of this dataset, not including the session ID column. This subset will be one-hot encoded and scaled before performing K-means clustering.
+
+```{r, echo=FALSE}
+# K-Means: 4 Clusters
+test.neuron.df$session = as.factor(test.neuron.df$session)
+
+df.oh = one_hot(as.data.table(subset(test.neuron.df, select = -c(session))))
+```
+
+```{r, echo=FALSE}
+df.oh = df.oh %>% as.data.frame()
+df.oh.scaled = df.oh %>% scale()
+```
+
+```{r, echo=FALSE}
+set.seed(1)
+test.fitk4 = kmeans(x = df.oh.scaled, center = 4, nstart = 100)
+```
+
+The cluster vector for 4 clusters (containing the cluster number for each neuron in this dataset) will be extracted and binded to the test neuron dataset. 
+
+```{r, echo=FALSE}
+test.df.k4 = cbind(test.neuron.df, test.fitk4$cluster)
+colnames(test.df.k4)[322] = "cluster"
+test.df.k4$cluster = as.factor(test.df.k4$cluster)
+```
+
+The same data integration processes will be carried out to create two dataframes for the test data, one dataframe including neuron firing rate averages for 3 neuron clusters for each trial and another dataframe including neuron firing rate averages for 4 neuron clusters for each trial.
+
+```{r, echo=FALSE}
+# get df for all neurons in trial with cluster column
+test.trial.neuron.df = function(session.num, trial.num, neuron.num) {
+  # initialize empty dataframe
+  neuron.trial = data.frame(bin1=integer(), bin2=integer(), bin3=integer(), bin4=integer(), bin5=integer(), bin6=integer(), bin7=integer(), bin8=integer(), bin9=integer(), bin10=integer(), bin11=integer(), bin12=integer(), bin13=integer(), bin14=integer(), bin15=integer(), bin16=integer(), bin17=integer(), bin18=integer(), bin19=integer(), bin20=integer(), bin21=integer(), bin22=integer(), bin23=integer(), bin24=integer(), bin25=integer(), bin26=integer(), bin27=integer(), bin28=integer(), bin29=integer(), bin30=integer(), bin31=integer(), bin32=integer(), bin33=integer(), bin34=integer(), bin35=integer(), bin36=integer(), bin37=integer(), bin38=integer(), bin39=integer(), bin40=integer(), session=integer(), trial=integer())
+  
+  # create matrix with vectors of all neurons (per 40 time bins) in a given trial (all neurons across one trials in a matrix) - bc in each trial, column values won't have avgs yet (only 1s and 0s)
+  for (i in 1:neuron.num) {
+    neuron.trial.vec = session[[session.num]]$spks[[trial.num]][i,]
+    neuron.trial.vec = c(neuron.trial.vec, c(session.num), c(trial.num))
+    neuron.trial[i,] = neuron.trial.vec # add neuron vector to overall neuron trial matrix
+  }
+  
+  neuron.trial = cbind("cluster" = (subset(test.df.k3, session == session.num))$cluster, neuron.trial)
+  
+  return(neuron.trial)
+}
+```
+
+```{r, echo=FALSE}
+# get trial avgs per cluster
+test.trial.avg.k3.vecs = function(neuron.trial.df) {
+  neuron.trial.df$cluster = as.numeric(neuron.trial.df$cluster)
+  neuron.trial.df.cluster1 = subset(neuron.trial.df, cluster == 1)
+  neuron.trial.df.cluster2 = subset(neuron.trial.df, cluster == 2)
+  neuron.trial.df.cluster3 = subset(neuron.trial.df, cluster == 3)
+  neuron.trial.df.cluster1.avg = colMeans(subset(neuron.trial.df.cluster1, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster2.avg = colMeans(subset(neuron.trial.df.cluster2, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster3.avg = colMeans(subset(neuron.trial.df.cluster3, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster.vec = c(as.vector(neuron.trial.df.cluster1.avg), as.vector(neuron.trial.df.cluster2.avg), as.vector(neuron.trial.df.cluster3.avg))
+  return(neuron.trial.df.cluster.vec)
+}
+```
+
+```{r, echo=FALSE}
+# create df for a session - all trials
+test.session.neuron.k3.df = function(session.num) {
+  session.df = data.frame(matrix(ncol = 124, nrow = 0))
+  for (i in 1:length(session[[session.num]]$spks)) { # 1:number of trials
+    # decision:
+    if (session[[session.num]]$contrast_left[i] > session[[session.num]]$contrast_right[i]){
+      decision = c(1)# right contrast < left contrast --> decision 1
+    }else if (session[[session.num]]$contrast_left[i] < session[[session.num]]$contrast_right[i]){
+      decision = c(2) # right contrast > left contrast --> decision 2
+    }else if (session[[session.num]]$contrast_left[i] == session[[session.num]]$contrast_right[i] 
+                   & session[[session.num]]$contrast_left[i] == 0){
+      decision = c(3) # left contrast = right contrast = 0 --> decision 3
+    }else{  # left contrast = right contrast != 0 --> decision 4
+      decision = c(4)
+    }
+    # calling trial df fcn: get.trial.neuron.df = function(session.num, trial.num, neuron.num)
+    trial.cluster.avgs.vec = test.trial.avg.k3.vecs(test.trial.neuron.df(session.num, i, length(session[[session.num]]$brain_area))) # 120 elem vector
+    session.trial.vec = c(session.num, i, session[[session.num]]$feedback_type[i], decision, as.vector(trial.cluster.avgs.vec)) # overall vector for a trial in a session
+    session.df[i,] = session.trial.vec
+  }
+  colnames(session.df)[1] = "session"
+  colnames(session.df)[2] = "trial"
+  colnames(session.df)[3] = "feedback"
+  colnames(session.df)[4] = "decision"
+  return(session.df)
+}
+```
+
+```{r, echo=FALSE}
+# create empty list to store the data frames
+test.neuron.k3.sessions.list = list()
+
+for (i in 1:2) {
+  data = test.session.neuron.k3.df(i)
+  
+  # assign a name to data frame
+  df_name = paste0("test.neuron.session.", i)
+  
+  # store the data frame in a list (of all session dfs)
+  test.neuron.k3.sessions.list[[df_name]] = data
+}
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k3 = bind_rows(test.neuron.k3.sessions.list)
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k3$session[test.df.neuron.k3$session == 2] = 18
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k3$feedback = as.factor(test.df.neuron.k3$feedback)
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k3[is.na(test.df.neuron.k3)] = 0
+```
+
+```{r, echo=FALSE}
+# get df for all neurons in trial with cluster column
+test.k4.trial.neuron.df = function(session.num, trial.num, neuron.num) {
+  # initialize empty dataframe
+  neuron.trial = data.frame(bin1=integer(), bin2=integer(), bin3=integer(), bin4=integer(), bin5=integer(), bin6=integer(), bin7=integer(), bin8=integer(), bin9=integer(), bin10=integer(), bin11=integer(), bin12=integer(), bin13=integer(), bin14=integer(), bin15=integer(), bin16=integer(), bin17=integer(), bin18=integer(), bin19=integer(), bin20=integer(), bin21=integer(), bin22=integer(), bin23=integer(), bin24=integer(), bin25=integer(), bin26=integer(), bin27=integer(), bin28=integer(), bin29=integer(), bin30=integer(), bin31=integer(), bin32=integer(), bin33=integer(), bin34=integer(), bin35=integer(), bin36=integer(), bin37=integer(), bin38=integer(), bin39=integer(), bin40=integer(), session=integer(), trial=integer())
+  
+  # create matrix with vectors of all neurons (per 40 time bins) in a given trial (all neurons across one trials in a matrix) - bc in each trial, column values won't have avgs yet (only 1s and 0s)
+  for (i in 1:neuron.num) {
+    neuron.trial.vec = session[[session.num]]$spks[[trial.num]][i,]
+    neuron.trial.vec = c(neuron.trial.vec, c(session.num), c(trial.num))
+    neuron.trial[i,] = neuron.trial.vec # add neuron vector to overall neuron trial matrix
+  }
+  
+  neuron.trial = cbind("cluster" = (subset(test.df.k4, session == session.num))$cluster, neuron.trial)
+  
+  return(neuron.trial)
+}
+```
+
+```{r, echo=FALSE}
+# get trial avgs per cluster
+test.trial.avg.k4.vecs = function(neuron.trial.df) {
+  neuron.trial.df$cluster = as.numeric(neuron.trial.df$cluster)
+  neuron.trial.df.cluster1 = subset(neuron.trial.df, cluster == 1)
+  neuron.trial.df.cluster2 = subset(neuron.trial.df, cluster == 2)
+  neuron.trial.df.cluster3 = subset(neuron.trial.df, cluster == 3)
+  neuron.trial.df.cluster4 = subset(neuron.trial.df, cluster == 4)
+  neuron.trial.df.cluster1.avg = colMeans(subset(neuron.trial.df.cluster1, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster2.avg = colMeans(subset(neuron.trial.df.cluster2, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster3.avg = colMeans(subset(neuron.trial.df.cluster3, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster4.avg = colMeans(subset(neuron.trial.df.cluster4, select = -c(cluster, trial, session)))
+  neuron.trial.df.cluster.vec = c(as.vector(neuron.trial.df.cluster1.avg), as.vector(neuron.trial.df.cluster2.avg), as.vector(neuron.trial.df.cluster3.avg), as.vector(neuron.trial.df.cluster4.avg))
+  #neuron.trial.df.cluster.vec
+  return(neuron.trial.df.cluster.vec)
+}
+```
+
+```{r, echo=FALSE}
+# create df for session 1 - all trials
+test.session.neuron.k4.df = function(session.num) {
+  session.df = data.frame(matrix(ncol = 164, nrow = 0))
+  for (i in 1:length(session[[session.num]]$spks)) { # 1:number of trials
+    # decision:
+    if (session[[session.num]]$contrast_left[i] > session[[session.num]]$contrast_right[i]){
+      decision = c(1)# right contrast < left contrast --> decision 1
+    }else if (session[[session.num]]$contrast_left[i] < session[[session.num]]$contrast_right[i]){
+      decision = c(2) # right contrast > left contrast --> decision 2
+    }else if (session[[session.num]]$contrast_left[i] == session[[session.num]]$contrast_right[i] 
+                   & session[[session.num]]$contrast_left[i] == 0){
+      decision = c(3) # left contrast = right contrast = 0 --> decision 3
+    }else{  # left contrast = right contrast != 0 --> decision 4
+      decision = c(4)
+    }
+    # calling trial df fcn: get.trial.neuron.df = function(session.num, trial.num, neuron.num)
+    trial.cluster.avgs.vec = test.trial.avg.k4.vecs(test.k4.trial.neuron.df(session.num, i, length(session[[session.num]]$brain_area))) # 160 elem vector
+    session.trial.vec = c(session.num, i, session[[session.num]]$feedback_type[i], decision, as.vector(trial.cluster.avgs.vec)) # overall vector for a trial in a session
+    session.df[i,] = session.trial.vec
+  }
+  colnames(session.df)[1] = "session"
+  colnames(session.df)[2] = "trial"
+  colnames(session.df)[3] = "feedback"
+  colnames(session.df)[4] = "decision"
+  #session.df[is.na(session.df)] = 0
+  return(session.df)
+}
+```
+
+```{r, echo=FALSE}
+# create empty list to store the data frames
+test.neuron.k4.sessions.list = list()
+
+for (i in 1:2) {
+  data = test.session.neuron.k4.df(i)
+  
+  # assign a name to data frame
+  df_name = paste0("neuron.session.", i)
+  
+  # store the data frame in a list (of all session dfs)
+  test.neuron.k4.sessions.list[[df_name]] = data
+}
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k4 = bind_rows(test.neuron.k4.sessions.list)
+test.df.neuron.k4$session[test.df.neuron.k4$session == 2] = 18
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k4$feedback = as.factor(test.df.neuron.k4$feedback)
+```
+
+```{r, echo=FALSE}
+test.df.neuron.k4[is.na(test.df.neuron.k4)] = 0
+```
+
+### Modeling 
+
+The best performing models trained and tested in this report's earlier prediction modeling will be applied to this test data, subsetted by decision types.
+
+The best performing model for Decisions 1 and 2 was the Logistic Regression model trained on a dataset that incorporates K-Means clustering for 3 clusters.
+
+Decision 1 and 2 Trials Error Rate:
+
+```{r, echo=FALSE}
+# Subsetting:
+test.df.k3.dec1 = subset(test.df.neuron.k3, decision == 1)
+test.df.k3.dec2 = subset(test.df.neuron.k3, decision == 2)
+test.df.k3.dec12 = bind_rows(test.df.k3.dec1, test.df.k3.dec2)
+test.df.k3.dec12 = test.df.k3.dec12[-c(5:24,45:64)]
+```
+
+
+```{r, echo=FALSE}
+# Prediction:
+pred.test.k3.dec12 = predict(fit.k3.dec12, subset(test.df.k3.dec12, select = -c(feedback)), type = 'response')
+prediction.test.k3.dec12 = factor(pred.test.k3.dec12 > 0.5, labels = c('-1', '1'))
+mean(prediction.test.k3.dec12 != test.df.k3.dec12$feedback)
+```
+
+The Logistic Regression model for Decisions 1 and 2 performs with a 0.3333 error rate on the test data.
+
+
+The best performing model for Decision 3 was the XGBoost model trained on a dataset that incorporates K-Means clustering for 4 clusters.
+
+Decision 3 Trials Error Rate:
+
+```{r, echo=FALSE}
+# Subsetting:
+test.df.k4.dec3 = subset(test.df.neuron.k4, decision == 3)
+```
+
+```{r, echo=FALSE, message=FALSE}
+pred.test.k4.dec3.xg = predict(fit.k4.dec3.xg, model.matrix(fit_tmp)[,-1])
+prediction.test.k4.dec3.xg = factor(pred.test.k4.dec3.xg > 0.5, labels = c('-1', '1'))
+suppressWarnings({
+  mean(prediction.test.k4.dec3.xg != test.df.k4.dec3$feedback)
+})
+```
+
+The XGBoost model for Decision 3 performs with a 0.3492 error rate on the test data.
+
+The best performing model for Decision 4 was the Logistic Regression model trained on a dataset that incorporates K-Means clustering for 4 clusters.
+
+Decision 4 Trials Error Rate:
+
+```{r, echo=FALSE}
+# Subsetting:
+test.df.k4.dec4 = subset(test.df.neuron.k4, decision == 4)
+```
+
+```{r, echo=FALSE}
+# Prediction:
+pred.test.k4.dec4 = predict(fit.k4.dec4, subset(test.df.k4.dec4, select = -c(feedback)), type = 'response')
+prediction.test.k4.dec4 = factor(pred.test.k4.dec4 > 0.5, labels = c('-1', '1'))
+mean(prediction.test.k4.dec4 != test.df.k4.dec4$feedback)
+```
+
+The XGBoost model for Decision 4 performs with a 0.4444 error rate on the test data.
+
+# Section 6: Discussion
+
+Through data exploration, neuron firing rates in trials were seen to have different patterns between trials that resulted in success and trials that resulted in failure. Neuron firing rates were also seen to differ between success and failure in trials with different decision types. With this knowledge, performing two K-Means clustering methods resulted in 3 and 4 potential clusters for all neurons in these sessions. In predictive modeling, neuron firing rates averaged over neurons from 3 clusters proved to be better at predicting feedback outcomes for trials that fell under Decisions 1 and 2. Neuron firing rates averaged over 4 clusters proved to be better at predicting feedback outcomes for trials that fell under Decisions 3 and 4. However, prediction errors for the best models for Decision 3 and 4 trials were still higher than those for the best model for Decision 1 and 2 trials. It may be possible that the differences in how success and failure were determined between decision types contributed to these differences in the best performing models and their error rates. 
+
+Trials that fall under the type of Decision 3 have the left contrast and right contrast both with the value of 0, with success occurring when the mouse does not turn towards either contrast. Neuron firing rates for Decision 3 saw greater neuron firing rate levels in trials that resulted in failure than in success. As this may be due to mice trying to choose one stimuli over another, as needed in every other decision type for this visual discrimination task, neuron activity may not be a good way of predicting feedback success. If the neuron firing rates associated with making a choice of turning towards one of the stimuli (which results in failure for Decision 3 trials) are higher than the neuron firing rates associated with no movement of the wheel (success for Decision 3 trials) then neuron firing rates may make it difficult to predict correctly for success and failure. 
+
+Trials that fall under the type of Decision 4 have the left and right contrasts equal but non-zero, with success allocated for a mouse turning towards a randomly chosen correct stimulus. As success is determined randomly in Decision 4 trials, it would be difficult to predict the correct feedback outcome based on any variables, including neuron firing rates. This makes building predictive models for Decision 4 trials likely to have low prediction accuracy.
+
+The prediction error rates for the three models ran on the test data, Logistic Regression for Decisions 1 and 2 trials with 3 neuron clusters, XGBoost for Decision 3 trials with 4 neuron clusters, and Logistic Regression for Decision 4 trials with 4 neuron clusters, increase with each decision type (lowest error rate for Decisions 1 and 2 and highest for Decision 4). As Decisions 3 and 4 are more difficult to predict success for using neuron firing rate data, we see higher error rates for models predicting these decisions. Decisions 1 and 2 had the highest prediction accuracy for the test data, which is consistent with the results from the initial prediction model building.
+
+It can be concluded that average neuron firing rates are better at predicting the outcome for trials of Decision types 1 and 2 than for Decision types 3 and 4. There are likely to be three different types of neurons in this dataset, as seen in the K-Means clustering results and modeling results for three clusters. The models based on three neuron clusters best predicted the outcomes for Decision types 1 and 2, while the models based on four neuron clusters best predicted the outcomes for Decision types 3 and 4. As Decision types 3 and 4 are difficult to predict the feedback outcome of (as discussed earlier) based on neuron firing rates, this doesn't necessarily make four neuron clusters as likely in this study. Since models based on neuron firing rates averaged over three neuron clusters better predicted the feedback outcome of Decision types 1 and 2, which are easier to predict using neuron firing rates, there may be three neuron clusters (perhaps related to neuron types) recorded for in the 18 sessions analyzed of this study.
+
+
+
